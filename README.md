@@ -17,7 +17,7 @@ A desktop GUI for discovering and testing Minecraft servers. It searches Shodan,
 - **Ignore / Saved lists:** Add servers to `ignore.txt` or `saved.txt` (with optional reasons) from any table; ignored servers are filtered everywhere.
 - **Minecraft integration:** Export any `.txt` list into `%APPDATA%\.minecraft\servers.dat` (creates a one-time `.bak` backup if none exists).
 - **Player filter:** Only show severs that have currently active players.
-- **Shows Players:** You can see who's currently playing on the detected servers.
+- **Shows Players:** You can see and search who's currently playing on the detected servers.
 - **Cracked:** Shows which servers are cracked.
 
 ---
