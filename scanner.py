@@ -28,6 +28,8 @@ try:
     _PIL_AVAILABLE = True
 except Exception:
     _PIL_AVAILABLE = False
+import hashlib
+import uuid
 
 init(autoreset=True)
 
@@ -358,16 +360,70 @@ def ping_server(entry):
             motd = parse_description(response.get('description', ''))
             players = response.get('players', {}).get('online', 0)
             max_players = response.get('players', {}).get('max', 0)
+            # sample is a list of dicts like {"id": "uuid", "name": "playername"}
+            sample = response.get('players', {}).get('sample', []) or []
+
+            # Normalize sample to list of tuples (id, name)
+            players_sample = []
+            for p in sample:
+                try:
+                    pid = str(p.get('id') or "")
+                    pname = str(p.get('name') or "")
+                    players_sample.append((pid, pname))
+                except Exception:
+                    continue
+
+            # cracked detection: if any reported player id matches the offline-mode UUID for that name
+            def _offline_uuid_for_name(name: str) -> str:
+                # Replicate Java's UUID.nameUUIDFromBytes("OfflinePlayer:" + name)
+                h = hashlib.md5()
+                h.update(b"OfflinePlayer:")
+                h.update(name.encode('utf-8'))
+                d = bytearray(h.digest())
+                # set variant and version bits like Java's nameUUIDFromBytes (version 3)
+                d[6] = (d[6] & 0x0f) | 0x30
+                d[8] = (d[8] & 0x3f) | 0x80
+                return str(uuid.UUID(bytes=bytes(d)))
+
+            cracked = False
+            for pid, pname in players_sample:
+                if not pname:
+                    continue
+                try:
+                    off_uuid = _offline_uuid_for_name(pname).replace('-', '').lower()
+                    reported = pid.replace('-', '').lower()
+                    if reported == off_uuid:
+                        cracked = True
+                        break
+                except Exception:
+                    continue
 
             return {
                 'ip': f"{host}:{port}",
                 'players': players,
                 'max_players': max_players,
                 'motd': motd,
-                'version': response.get('version', {}).get('name', 'N/A')
+                'version': response.get('version', {}).get('name', 'N/A'),
+                'players_sample': players_sample,
+                'cracked': cracked
             }
     except:
         return None
+
+def format_player_list(sample):
+    """
+    Returns a comma-separated string of player names from the sample, or "-" if none.
+    """
+    names = []
+    for item in sample or []:
+        name = None
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            name = item[1]
+        elif isinstance(item, dict):
+            name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return ", ".join(names) if names else "-"
 
 def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
     try:
@@ -727,6 +783,77 @@ def save_ips_rows(rows, file_path=GLOBAL_IP_LOG):
             players = players or "N/A"
             f.write(f"{ip} | MOTD: {sanitize_motd(motd)} | Players: {players} | Version: {version}\n")
 
+def ask_reason_with_whitelist(parent, title="Reason", prompt="Why ignore? (optional)"):
+
+    dlg = tk.Toplevel(parent)
+    dlg.transient(parent)
+    dlg.grab_set()
+    dlg.title(title)
+
+    # Make small, non-resizable and center over parent (best-effort)
+    try:
+        dlg.resizable(False, False)
+    except Exception:
+        pass
+
+    frm = ttk.Frame(dlg, padding=(12, 10))
+    frm.pack(fill="both", expand=True)
+
+    ttk.Label(frm, text=prompt).pack(anchor="w", pady=(0,6))
+
+    var = tk.StringVar()
+    entry = ttk.Entry(frm, textvariable=var, width=60)
+    entry.pack(fill="x", expand=True)
+    entry.focus_set()
+
+    btns = ttk.Frame(frm)
+    btns.pack(fill="x", pady=(10,0))
+
+    def _close_with(val):
+        dlg.result = None if val is None else str(val)
+        try:
+            dlg.grab_release()
+        except Exception:
+            pass
+        dlg.destroy()
+
+    def _on_ok():
+        _close_with(var.get().strip() if var.get().strip() else "")
+
+    def _on_whitelist():
+        # immediate accept with "White List"
+        _close_with("White List")
+
+    def _on_cancel():
+        _close_with(None)
+
+    # Buttons: OK, White List, Cancel
+    ttk.Button(btns, text="OK", command=_on_ok).pack(side="left", padx=(0,6))
+    ttk.Button(btns, text="White List", command=_on_whitelist).pack(side="left", padx=(0,6))
+    ttk.Button(btns, text="Cancel", command=_on_cancel).pack(side="left")
+
+    # Bind Enter / Escape keys
+    dlg.bind("<Return>", lambda e: _on_ok())
+    dlg.bind("<Escape>", lambda e: _on_cancel())
+
+    # center over parent (best-effort)
+    try:
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        dlg.update_idletasks()
+        w = dlg.winfo_reqwidth()
+        h = dlg.winfo_reqheight()
+        x = px + max(0, (pw - w) // 2)
+        y = py + max(0, (ph - h) // 2)
+        dlg.geometry(f"+{x}+{y}")
+    except Exception:
+        pass
+
+    parent.wait_window(dlg)
+    return getattr(dlg, "result", None)
 
 # ========================================  
 
@@ -897,7 +1024,12 @@ class ServersTab(ttk.Frame):  #
         if not sel:
             messagebox.showinfo("Info","Select one or more.")
             return
-        reason = simpledialog.askstring("Reason","Why ignore? (optional)")
+        # use the new dialog that offers a "White List" shortcut button
+        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
+        # If user cancelled (None), do nothing
+        if reason is None:
+            self.set_status("Ignore cancelled.")
+            return
         for ip in sel:
             add_to_ignore(ip, reason or "")
         # remove from self.servers
@@ -942,7 +1074,7 @@ class ServersTab(ttk.Frame):  #
         middle.pack(fill="both", expand=True, padx=8, pady=(0,8))
 
         # Source Tree (no icons here)
-        cols = ("ip", "motd", "players", "version")
+        cols = ("ip", "motd", "players", "version", "cracked")
         self.source_tree = ttk.Treeview(middle, columns=cols, show="headings", height=12, selectmode="extended")
         for c in cols:
             self.source_tree.heading(c, text=c.upper())
@@ -955,7 +1087,8 @@ class ServersTab(ttk.Frame):  #
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
             "players": _players_key,
-            "version": _version_key
+            "version": _version_key,
+            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1
         })
 
         right = ttk.Frame(middle)
@@ -978,12 +1111,16 @@ class ServersTab(ttk.Frame):  #
         res_frame = ttk.Frame(bottom)
         res_frame.pack(fill="both", expand=True)
 
-        cols2 = ("ip", "motd", "players", "version")
+        cols2 = ("ip", "motd", "players", "version", "cracked", "active_players")
         # show icons ONLY in results tree
         self.results_tree = ttk.Treeview(res_frame, columns=cols2, show="headings", height=10, selectmode="extended")
         for c in cols2:
             self.results_tree.heading(c, text=c.upper())
-            self.results_tree.column(c, width=220 if c == "motd" else 160, anchor="w")
+            if c in ("motd", "active_players"):
+                width = 240
+            else:
+                width = 160
+            self.results_tree.column(c, width=width, anchor="w")
         self.results_tree.pack(side="left", fill="both", expand=True)
         res_sb = ttk.Scrollbar(res_frame, orient="vertical", command=self.results_tree.yview)
         res_sb.pack(side="left", fill="y")
@@ -992,7 +1129,9 @@ class ServersTab(ttk.Frame):  #
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
             "players": _players_key,
-            "version": _version_key
+            "version": _version_key,
+            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1,
+            "active_players": lambda v: str(v).lower()
         })
 
         # ------- Footer (pinned) -------
@@ -1006,6 +1145,11 @@ class ServersTab(ttk.Frame):  #
         ttk.Button(res_btns, text="Add to Ignore", command=self.ignore_scan_selected).pack(side="left", padx=4)
         ttk.Button(res_btns, text="Add to Saved", command=self.save_scan_selected).pack(side="left", padx=4)
         ttk.Button(res_btns, text="Export Scan…", command=self.export_scan_results).pack(side="left", padx=4)
+        self.player_search_var = tk.StringVar()
+        search_entry = ttk.Entry(res_btns, textvariable=self.player_search_var, width=18)
+        search_entry.pack(side="left", padx=(12,4))
+        search_entry.bind("<Return>", lambda _e: self.search_players())
+        ttk.Button(res_btns, text="Find Player", command=self.search_players).pack(side="left", padx=4)
 
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(footer, textvariable=self.status, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12,0))
@@ -1105,7 +1249,10 @@ class ServersTab(ttk.Frame):  #
         if not rows:
             messagebox.showinfo("Info", "Select results first.")
             return
-        reason = simpledialog.askstring("Reason","Why ignore? (optional)")
+        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
+        if reason is None:
+            self.set_status("Ignore cancelled.")
+            return
         for ip, *_ in rows:
             add_to_ignore(ip, reason or "")
         for iid in list(self.results_tree.selection()):
@@ -1146,13 +1293,44 @@ class ServersTab(ttk.Frame):  #
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
-            for (ip, motd, players, version) in rows:
+            for row in rows:
+                if not row:
+                    continue
+                ip = row[0]
+                motd = row[1] if len(row) > 1 else ""
+                players = row[2] if len(row) > 2 else "N/A"
+                version = row[3] if len(row) > 3 else "N/A"
                 if "/" in str(players):
                     online, maximum = str(players).split("/", 1)
                 else:
                     online, maximum = "N", "A"
                 f.write(format_result_line(ip, motd, online, maximum, version) + "\n")
         self.set_status(f"Exported {len(rows)} scan rows to {os.path.basename(path)}")
+
+    def search_players(self):
+        query_raw = self.player_search_var.get() or ""
+        query = query_raw.strip().lower()
+        if not query:
+            self.set_status("Enter a player name to search.")
+            return
+        matches = []
+        for iid in self.results_tree.get_children():
+            vals = self.results_tree.item(iid, "values")
+            if not vals:
+                continue
+            players_text = vals[5] if len(vals) >= 6 else (vals[-1] if vals else "")
+            if isinstance(players_text, str) and query in players_text.lower():
+                matches.append(iid)
+        current_sel = self.results_tree.selection()
+        if current_sel:
+            self.results_tree.selection_remove(current_sel)
+        if matches:
+            self.results_tree.selection_set(matches)
+            self.results_tree.focus(matches[0])
+            self.results_tree.see(matches[0])
+            self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
+        else:
+            self.set_status(f"No matches for '{query_raw.strip()}'.")
 
     def _scan(self, items):
         for iid in self.results_tree.get_children():
@@ -1167,8 +1345,19 @@ class ServersTab(ttk.Frame):  #
                     self.after(0, lambda ip=ip: self.set_status(f"Currently scanning: {ip} [0/{total}]"))
 
                 def on_result(r, line):
-                    if r and (not self.only_players_var.get() or r.get('players', 0) > 0):
-                        vals = (r['ip'], r['motd'], f"{r['players']}/{r['max_players']}", r['version'])
+                    if not r:
+                        return
+
+                    if not self.only_players_var.get() or r.get('players', 0) > 0:
+                        active_players = format_player_list(r.get('players_sample'))
+                        vals = (
+                            r['ip'],
+                            r['motd'],
+                            f"{r['players']}/{r['max_players']}",
+                            r['version'],
+                            "Yes" if r.get('cracked') else "No",
+                            active_players
+                        )
                         self.after(0, lambda v=vals: self.results_tree.insert("", "end", values=v))
 
                 def on_progress(done, total):
@@ -1269,11 +1458,15 @@ class ShodanTab(ttk.Frame):
         of = ttk.Frame(out)
         of.pack(fill="both", expand=True)
 
-        cols_out = ("ip","motd","players","version")
+        cols_out = ("ip","motd","players","version","cracked","active_players")
         self.scan_tree = ttk.Treeview(of, columns=cols_out, show="headings", height=8, selectmode="extended")
         for c in cols_out:
             self.scan_tree.heading(c, text=c.upper())
-            self.scan_tree.column(c, width=220 if c=="motd" else 160, anchor="w")
+            if c in ("motd", "active_players"):
+                width = 240
+            else:
+                width = 160
+            self.scan_tree.column(c, width=width, anchor="w")
         self.scan_tree.pack(side="left", fill="both", expand=True)
         osb = ttk.Scrollbar(of, orient="vertical", command=self.scan_tree.yview)
         osb.pack(side="left", fill="y")
@@ -1282,7 +1475,9 @@ class ShodanTab(ttk.Frame):
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
             "players": _players_key,
-            "version": _version_key
+            "version": _version_key,
+            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1,
+            "active_players": lambda v: str(v).lower()
         })
 
         # ------- Footer (pinned) -------
@@ -1400,7 +1595,10 @@ class ShodanTab(ttk.Frame):
         if not sel:
             messagebox.showinfo("Info","Select items first.")
             return
-        reason = simpledialog.askstring("Reason","Why ignore? (optional)")
+        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
+        if reason is None:
+            self.set_status("Ignore cancelled.")
+            return
         for ip in sel:
             add_to_ignore(ip, reason or "")
         for iid in list(self.tree.selection()):
@@ -1422,7 +1620,10 @@ class ShodanTab(ttk.Frame):
         if not rows:
             messagebox.showinfo("Info", "Select scan output rows.")
             return
-        reason = simpledialog.askstring("Reason","Why ignore? (optional)")
+        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
+        if reason is None:
+            self.set_status("Ignore cancelled.")
+            return
         for ip, *_ in rows:
             add_to_ignore(ip, reason or "")
         for iid in list(self.scan_tree.selection()):
@@ -1459,13 +1660,44 @@ class ShodanTab(ttk.Frame):
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
-            for (ip, motd, players, version) in rows:
+            for row in rows:
+                if not row:
+                    continue
+                ip = row[0]
+                motd = row[1] if len(row) > 1 else ""
+                players = row[2] if len(row) > 2 else "N/A"
+                version = row[3] if len(row) > 3 else "N/A"
                 if "/" in str(players):
                     online, maximum = str(players).split("/", 1)
                 else:
                     online, maximum = "N", "A"
                 f.write(format_result_line(ip, motd, online, maximum, version) + "\n")
         self.set_status(f"Exported {len(rows)} scan rows to {os.path.basename(path)}")
+
+    def search_players(self):
+        query_raw = self.player_search_var.get() or ""
+        query = query_raw.strip().lower()
+        if not query:
+            self.set_status("Enter a player name to search.")
+            return
+        matches = []
+        for iid in self.scan_tree.get_children():
+            vals = self.scan_tree.item(iid, "values")
+            if not vals:
+                continue
+            players_text = vals[5] if len(vals) >= 6 else (vals[-1] if vals else "")
+            if isinstance(players_text, str) and query in players_text.lower():
+                matches.append(iid)
+        current_sel = self.scan_tree.selection()
+        if current_sel:
+            self.scan_tree.selection_remove(current_sel)
+        if matches:
+            self.scan_tree.selection_set(matches)
+            self.scan_tree.focus(matches[0])
+            self.scan_tree.see(matches[0])
+            self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
+        else:
+            self.set_status(f"No matches for '{query_raw.strip()}'.")
 
     def _scan_and_show(self, items):
         for iid in self.scan_tree.get_children():
@@ -1479,8 +1711,19 @@ class ShodanTab(ttk.Frame):
                     self.after(0, lambda ip=ip: self.set_status(f"Currently scanning: {ip} [0/{len(items)}]"))
 
                 def on_result(r, line):
-                    if r and (not self.only_players_var.get() or r.get('players', 0) > 0):
-                        vals = (r['ip'], r['motd'], f"{r['players']}/{r['max_players']}", r['version'])
+                    if not r:
+                        return
+
+                    if not self.only_players_var.get() or r.get('players', 0) > 0:
+                        active_players = format_player_list(r.get('players_sample'))
+                        vals = (
+                            r['ip'],
+                            r['motd'],
+                            f"{r['players']}/{r['max_players']}",
+                            r['version'],
+                            "Yes" if r.get('cracked') else "No",
+                            active_players
+                        )
                         self.after(0, lambda v=vals: self.scan_tree.insert("", "end", values=v))
 
                 def on_progress(done, total):
@@ -1610,11 +1853,15 @@ class JSONTab(ttk.Frame):
         of = ttk.Frame(out)
         of.pack(fill="both", expand=True)
 
-        cols2 = ("ip","motd","players","version")
+        cols2 = ("ip","motd","players","version","cracked","active_players")
         self.scan_tree = ttk.Treeview(of, columns=cols2, show="headings", height=8, selectmode="extended")
         for c in cols2:
             self.scan_tree.heading(c, text=c.upper())
-            self.scan_tree.column(c, width=220 if c=="motd" else 160, anchor="w")
+            if c in ("motd", "active_players"):
+                width = 240
+            else:
+                width = 160
+            self.scan_tree.column(c, width=width, anchor="w")
         self.scan_tree.pack(side="left", fill="both", expand=True)
         osb = ttk.Scrollbar(of, orient="vertical", command=self.scan_tree.yview)
         osb.pack(side="left", fill="y")
@@ -1623,7 +1870,9 @@ class JSONTab(ttk.Frame):
             "ip": _ip_key,
             "motd": lambda v: str(v).lower(),
             "players": _players_key,
-            "version": _version_key
+            "version": _version_key,
+            "cracked": lambda v: (0 if str(v).lower() in ("false","no","0") else 1) if v is not None else -1,
+            "active_players": lambda v: str(v).lower()
         })
 
         # ------- Footer (pinned) -------
@@ -1637,6 +1886,11 @@ class JSONTab(ttk.Frame):
         ttk.Button(obtns, text="Add to Ignore", command=self.ignore_scan_selected).pack(side="left", padx=4)
         ttk.Button(obtns, text="Add to Saved", command=self.save_scan_selected).pack(side="left", padx=4)
         ttk.Button(obtns, text="Export Scan…", command=self.export_scan_output).pack(side="left", padx=4)
+        self.player_search_var = tk.StringVar()
+        search_entry = ttk.Entry(obtns, textvariable=self.player_search_var, width=18)
+        search_entry.pack(side="left", padx=(12,4))
+        search_entry.bind("<Return>", lambda _e: self.search_players())
+        ttk.Button(obtns, text="Find Player", command=self.search_players).pack(side="left", padx=4)
 
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(footer, textvariable=self.status, anchor="w").grid(row=0, column=1, sticky="ew", padx=(12,0))
@@ -1702,7 +1956,10 @@ class JSONTab(ttk.Frame):
         if not rows:
             messagebox.showinfo("Info","Select items first.")
             return
-        reason = simpledialog.askstring("Reason","Why ignore? (optional)")
+        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
+        if reason is None:
+            self.set_status("Ignore cancelled.")
+            return
         self._in_ignore = True
         try:
             for (ip, *_rest) in rows:
@@ -1733,6 +1990,31 @@ class JSONTab(ttk.Frame):
                 out.append(vals)
         return out
 
+    def search_players(self):
+        query_raw = self.player_search_var.get() or ""
+        query = query_raw.strip().lower()
+        if not query:
+            self.set_status("Enter a player name to search.")
+            return
+        matches = []
+        for iid in self.scan_tree.get_children():
+            vals = self.scan_tree.item(iid, "values")
+            if not vals:
+                continue
+            players_text = vals[5] if len(vals) >= 6 else (vals[-1] if vals else "")
+            if isinstance(players_text, str) and query in players_text.lower():
+                matches.append(iid)
+        current_sel = self.scan_tree.selection()
+        if current_sel:
+            self.scan_tree.selection_remove(current_sel)
+        if matches:
+            self.scan_tree.selection_set(matches)
+            self.scan_tree.focus(matches[0])
+            self.scan_tree.see(matches[0])
+            self.set_status(f"Found {len(matches)} match(es) for '{query_raw.strip()}'.")
+        else:
+            self.set_status(f"No matches for '{query_raw.strip()}'.")
+
     def _scan_and_show(self, items):
         for iid in self.scan_tree.get_children():
             self.scan_tree.delete(iid)
@@ -1746,8 +2028,19 @@ class JSONTab(ttk.Frame):
                     self.after(0, lambda ip=ip: self.set_status(f"Currently scanning: {ip} [0/{total}]"))
 
                 def on_result(r, line):
-                    if r and (not self.only_players_var.get() or r.get('players', 0) > 0):
-                        vals = (r['ip'], r['motd'], f"{r['players']}/{r['max_players']}", r['version'])
+                    if not r:
+                        return
+
+                    if not self.only_players_var.get() or r.get('players', 0) > 0:
+                        active_players = format_player_list(r.get('players_sample'))
+                        vals = (
+                            r['ip'],
+                            r['motd'],
+                            f"{r['players']}/{r['max_players']}",
+                            r['version'],
+                            "Yes" if r.get('cracked') else "No",
+                            active_players
+                        )
                         self.after(0, lambda v=vals: self.scan_tree.insert("", "end", values=v))
 
                 def on_progress(done, total):
@@ -1794,7 +2087,10 @@ class JSONTab(ttk.Frame):
         if not rows:
             messagebox.showinfo("Info", "Select scan output rows.")
             return
-        reason = simpledialog.askstring("Reason", "Why ignore? (optional)")
+        reason = ask_reason_with_whitelist(self, "Reason", "Why ignore? (optional)")
+        if reason is None:
+            self.set_status("Ignore cancelled.")
+            return
         for (ip, *_rest) in rows:
             add_to_ignore(ip, reason or "")
         for iid in list(self.scan_tree.selection()):
@@ -1854,7 +2150,13 @@ class JSONTab(ttk.Frame):
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
-            for (ip, motd, players, version) in rows:
+            for row in rows:
+                if not row:
+                    continue
+                ip = row[0]
+                motd = row[1] if len(row) > 1 else ""
+                players = row[2] if len(row) > 2 else "N/A"
+                version = row[3] if len(row) > 3 else "N/A"
                 if "/" in str(players):
                     online, maximum = str(players).split("/",1)
                 else:
