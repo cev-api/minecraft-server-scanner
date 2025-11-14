@@ -55,6 +55,11 @@ A desktop GUI for discovering and testing Minecraft servers. It searches Shodan,
 ### IP Log
 - Reads your ips.txt and allows editing and copying
 
+### Player Log
+- Keeps a log of all players discovered and stores it in ``user_log.json``
+- Allows you to see their last known server location
+- Can export the data or copy specific IP addresses or usernames
+
   
 ---
 
