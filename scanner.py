@@ -44,6 +44,7 @@ BACKUP_PATH = SERVERS_DAT_PATH + ".bak"
 IGNORE_FILE = "ignore.txt"
 SAVED_FILE = "saved.txt"
 DEFAULT_JSONL_FILE = "minecraft_servers.json"
+USER_LOG_FILE = "user_log.json"
 
 ICON_ENABLED = True           
 ICON_SIZE = 24                
@@ -425,6 +426,97 @@ def format_player_list(sample):
             names.append(name.strip())
     return ", ".join(names) if names else "-"
 
+
+class UserLogManager:
+    """
+    Thread-safe store that tracks the last seen server for each player name.
+    """
+    def __init__(self):
+        self._entries = {}  # player -> {"ip": ..., "motd": ..., "last_seen": ts}
+        self._lock = threading.Lock()
+        self._tab = None
+        self._load_from_disk()
+
+    def attach_tab(self, tab: "UserLogTab"):
+        self._tab = tab
+        tab.bind_manager(self)
+        tab.request_refresh(initial=True)
+
+    def snapshot(self):
+        with self._lock:
+            return [
+                {
+                    "player": player,
+                    "ip": data["ip"],
+                    "motd": data["motd"],
+                    "last_seen": data["last_seen"]
+                }
+                for player, data in self._entries.items()
+            ]
+
+    def update_from_result(self, result: dict):
+        sample = result.get("players_sample") or []
+        if not sample:
+            return
+        ip = result.get("ip", "")
+        motd = result.get("motd", "")
+        now = time.time()
+        changed = False
+        with self._lock:
+            for _pid, pname in sample:
+                player = (pname or "").strip()
+                if not player:
+                    continue
+                entry = self._entries.get(player)
+                if not entry or entry["ip"] != ip or entry["motd"] != motd:
+                    self._entries[player] = {"ip": ip, "motd": motd, "last_seen": now}
+                else:
+                    self._entries[player]["last_seen"] = now
+                changed = True
+        if changed:
+            self._save_to_disk()
+            self._notify_tab()
+
+    def _notify_tab(self):
+        if self._tab:
+            self._tab.request_refresh()
+
+    def _load_from_disk(self):
+        if not os.path.exists(USER_LOG_FILE):
+            return
+        try:
+            with open(USER_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if not isinstance(data, list):
+            return
+        entries = {}
+        for row in data:
+            try:
+                player = (row.get("player") or "").strip()
+                if not player:
+                    continue
+                ip = row.get("ip") or ""
+                motd = row.get("motd") or ""
+                ts = float(row.get("last_seen") or 0)
+                entries[player] = {"ip": ip, "motd": motd, "last_seen": ts}
+            except Exception:
+                continue
+        with self._lock:
+            self._entries = entries
+
+    def _save_to_disk(self):
+        snapshot = self.snapshot()
+        try:
+            with open(USER_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2)
+        except Exception:
+            pass
+
+
+USER_LOG_MANAGER = UserLogManager()
+
 def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
     try:
         host, port = split_host_port(entry)
@@ -478,6 +570,7 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None):
                 updated_ips[ip_key] = line
                 if r['players'] > 0:
                     online_lines.append(line)
+                USER_LOG_MANAGER.update_from_result(r)
                 if on_result:
                     try: on_result(r, line)
                     except Exception: pass
@@ -717,6 +810,38 @@ def filter_entries_JSON(data: List[dict], query: str) -> List[str]:
             out.append(extract_formatted_JSON(entry))
     return out
 
+def load_json_entries(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File '{file_path}' not found.")
+    entries = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON on line {idx}: {e}") from e
+    return entries
+
+def json_entries_to_rows(entries: List[dict]):
+    rows = []
+    seen = set()
+    for entry in entries:
+        formatted = extract_formatted_JSON(entry)
+        ip, motd, players, version = parse_formatted_line(formatted)
+        ip = get_ip_only(ip)
+        if not is_valid_ip_port(ip):
+            continue
+        if is_ignored(ip):
+            continue
+        if ip in seen:
+            continue
+        rows.append((ip, motd, players, version))
+        seen.add(ip)
+    return rows
+
 def json_search_load(file_path, query):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File '{file_path}' not found.")
@@ -860,8 +985,10 @@ def ask_reason_with_whitelist(parent, title="Reason", prompt="Why ignore? (optio
 class _IconManager:
     def __init__(self):
         self._cache_bytes = {}        # ip -> png bytes or None
+        self._cache_images = {}       # ip -> PhotoImage (or placeholder)
         self._executor = ThreadPoolExecutor(max_workers=max(1, ICON_THREADS))
         self._attached = set()
+        self._placeholder_image = None
 
     def _ensure_tree_ready(self, tree: ttk.Treeview):
         # turn on the tree column to host images, center it, set width
@@ -913,7 +1040,7 @@ class _IconManager:
         # if already cached, set immediately on UI thread
         if ip in self._cache_bytes:
             data = self._cache_bytes[ip]
-            self._apply_icon_to_item(tree, iid, data)
+            self._apply_icon_to_item(tree, iid, ip, data)
             return
 
         # fetch in background
@@ -922,23 +1049,30 @@ class _IconManager:
             # cache whether None or bytes to avoid repeat lookups
             self._cache_bytes[ip] = data
             try:
-                tree.after(0, lambda: self._apply_icon_to_item(tree, iid, data))
+                tree.after(0, lambda: self._apply_icon_to_item(tree, iid, ip, data))
             except Exception:
                 pass
 
         self._executor.submit(work)
 
-    def _apply_icon_to_item(self, tree: ttk.Treeview, iid: str, png_bytes: bytes):
+    def _apply_icon_to_item(self, tree: ttk.Treeview, iid: str, ip: str, png_bytes: bytes | None):
         try:
-            photo = self._make_photo(png_bytes)
-            if photo is None:
-                photo = self._placeholder_photo()
+            photo = self._photo_for_ip(ip, png_bytes)
             # keep ref
             tree._icon_images[iid] = photo
             tree.item(iid, image=photo, text="")
         except Exception:
             # ignore per-row failures silently
             pass
+
+    def _photo_for_ip(self, ip: str, png_bytes: bytes | None):
+        if ip in self._cache_images:
+            return self._cache_images[ip]
+        photo = self._make_photo(png_bytes)
+        if photo is None:
+            photo = self._placeholder_photo()
+        self._cache_images[ip] = photo
+        return photo
 
     def _make_photo(self, png_bytes):
         if not png_bytes:
@@ -963,9 +1097,12 @@ class _IconManager:
             return None
 
     def _placeholder_photo(self):
+        if self._placeholder_image is not None:
+            return self._placeholder_image
         # simple solid square to reserve space
         img = tk.PhotoImage(width=ICON_SIZE, height=ICON_SIZE)
         img.put(ICON_PLACEHOLDER, to=(0, 0, ICON_SIZE, ICON_SIZE))
+        self._placeholder_image = img
         return img
 
 
@@ -999,6 +1136,7 @@ class FullAppGUI(tk.Tk):  #
         self.saved_tab = SavedTab(nb)    
         self.ignore_tab = IgnoreTab(nb)  
         self.iplog_tab = IpLogTab(nb)    
+        self.user_log_tab = UserLogTab(nb)
 
         nb.add(self.servers_tab, text="Servers")
         nb.add(self.shodan_tab, text="Shodan")
@@ -1007,6 +1145,9 @@ class FullAppGUI(tk.Tk):  #
         nb.add(self.saved_tab, text="Saved List")  
         nb.add(self.ignore_tab, text="Ignore List")
         nb.add(self.iplog_tab, text="IP Log")     
+        nb.add(self.user_log_tab, text="User Log")
+
+        USER_LOG_MANAGER.attach_tab(self.user_log_tab)
 
 # ---- Servers Tab ----
 class ServersTab(ttk.Frame):  #
@@ -1078,7 +1219,17 @@ class ServersTab(ttk.Frame):  #
         self.source_tree = ttk.Treeview(middle, columns=cols, show="headings", height=12, selectmode="extended")
         for c in cols:
             self.source_tree.heading(c, text=c.upper())
-            self.source_tree.column(c, width=220 if c == "motd" else 160, anchor="w")
+            if c == "motd":
+                width = 240
+            elif c == "players":
+                width = 120
+            elif c == "version":
+                width = 120
+            elif c == "cracked":
+                width = 90
+            else:
+                width = 170
+            self.source_tree.column(c, width=width, anchor="w")
         self.source_tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(middle, orient="vertical", command=self.source_tree.yview)
         sb.pack(side="left", fill="y")
@@ -1118,8 +1269,14 @@ class ServersTab(ttk.Frame):  #
             self.results_tree.heading(c, text=c.upper())
             if c in ("motd", "active_players"):
                 width = 240
+            elif c == "players":
+                width = 130
+            elif c == "version":
+                width = 130
+            elif c == "cracked":
+                width = 90
             else:
-                width = 160
+                width = 170
             self.results_tree.column(c, width=width, anchor="w")
         self.results_tree.pack(side="left", fill="both", expand=True)
         res_sb = ttk.Scrollbar(res_frame, orient="vertical", command=self.results_tree.yview)
@@ -1427,7 +1584,15 @@ class ShodanTab(ttk.Frame):
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=14, selectmode="extended")
         for c in cols:
             self.tree.heading(c, text=c.upper())
-            self.tree.column(c, width=220 if c=="motd" else 160, anchor="w")
+            if c == "motd":
+                width = 240
+            elif c == "players":
+                width = 120
+            elif c == "version":
+                width = 120
+            else:
+                width = 170
+            self.tree.column(c, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         sb.pack(side="left", fill="y")
@@ -1464,8 +1629,14 @@ class ShodanTab(ttk.Frame):
             self.scan_tree.heading(c, text=c.upper())
             if c in ("motd", "active_players"):
                 width = 240
+            elif c == "players":
+                width = 130
+            elif c == "version":
+                width = 130
+            elif c == "cracked":
+                width = 90
             else:
-                width = 160
+                width = 170
             self.scan_tree.column(c, width=width, anchor="w")
         self.scan_tree.pack(side="left", fill="both", expand=True)
         osb = ttk.Scrollbar(of, orient="vertical", command=self.scan_tree.yview)
@@ -1791,9 +1962,15 @@ class JSONTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self._in_ignore = False
+        self.json_entries = []
+        self.all_rows = []
+        self._loaded_json_path = None
         self._build_ui()
         self._current_scan_ip = None
         self.search_rows = []  # list[tuple(ip,motd,players,version)]
+        default_path = self.file_var.get().strip()
+        if default_path and os.path.exists(default_path):
+            self.load_json_file(default_path)
 
     def _build_ui(self):
         # Root grid: content (row 0) + footer (row 1) pinned
@@ -1815,15 +1992,26 @@ class JSONTab(ttk.Frame):
         ttk.Button(bar, text="Search", command=self.search).pack(side="left")
         ttk.Button(bar, text="Export Search…", command=self.export_search_results).pack(side="left", padx=6)
 
-        mid = ttk.Frame(content)
-        mid.pack(fill="both", expand=True, padx=8, pady=4)
+        pane = tk.PanedWindow(content, orient="vertical", sashwidth=8)
+        pane.pack(fill="both", expand=True, padx=8, pady=4)
+
+        mid = ttk.Frame(pane)
+        pane.add(mid, minsize=260)
 
         # Search results Treeview with same columns
         cols = ("ip","motd","players","version")
         self.search_tree = ttk.Treeview(mid, columns=cols, show="headings", height=12, selectmode="extended")
         for c in cols:
             self.search_tree.heading(c, text=c.upper())
-            self.search_tree.column(c, width=220 if c=="motd" else 160, anchor="w")
+            if c == "motd":
+                width = 240
+            elif c == "players":
+                width = 120
+            elif c == "version":
+                width = 120
+            else:
+                width = 170
+            self.search_tree.column(c, width=width, anchor="w")
         self.search_tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.search_tree.yview)
         sb.pack(side="left", fill="y")
@@ -1847,8 +2035,8 @@ class JSONTab(ttk.Frame):
         ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
 
         # Scan output -> Treeview (still inside content)
-        out = ttk.Frame(content)
-        out.pack(fill="both", expand=False, padx=8, pady=(0,0))
+        out = ttk.Frame(pane)
+        pane.add(out, minsize=220)
         ttk.Label(out, text="Scan Output (select to copy/save/ignore):").pack(anchor="w")
         of = ttk.Frame(out)
         of.pack(fill="both", expand=True)
@@ -1859,8 +2047,14 @@ class JSONTab(ttk.Frame):
             self.scan_tree.heading(c, text=c.upper())
             if c in ("motd", "active_players"):
                 width = 240
+            elif c == "players":
+                width = 130
+            elif c == "version":
+                width = 130
+            elif c == "cracked":
+                width = 90
             else:
-                width = 160
+                width = 170
             self.scan_tree.column(c, width=width, anchor="w")
         self.scan_tree.pack(side="left", fill="both", expand=True)
         osb = ttk.Scrollbar(of, orient="vertical", command=self.scan_tree.yview)
@@ -1902,33 +2096,82 @@ class JSONTab(ttk.Frame):
     def set_status(self,msg):
         self.status.set(msg)
 
+    def _populate_search_tree(self, rows):
+        self.search_tree.delete(*self.search_tree.get_children())
+        for ip, motd, players, version in rows:
+            self.search_tree.insert("", "end", values=(ip, motd, players, version))
+
+    def _load_json_data(self, path):
+        entries = load_json_entries(path)
+        rows = json_entries_to_rows(entries)
+        return entries, rows
+
+    def load_json_file(self, path):
+        if not path:
+            return
+        self._populate_search_tree([])
+        self.set_status("Loading JSON…")
+        def work():
+            try:
+                entries, rows = self._load_json_data(path)
+                def update():
+                    self.json_entries = entries
+                    self.all_rows = rows
+                    self.search_rows = list(rows)
+                    self._loaded_json_path = path
+                    self._populate_search_tree(rows)
+                    self.set_status(f"Loaded {len(rows)} entries from {os.path.basename(path)}.")
+                self.after(0, update)
+            except Exception as e:
+                self.after(0, lambda: self.set_status(f"Load failed: {e}"))
+        threading.Thread(target=work, daemon=True).start()
+
     def pick_json(self):
         path = filedialog.askopenfilename(title="Pick JSON Lines", filetypes=[("JSON/JSONL","*.json *.jsonl *.*")])
         if path:
             self.file_var.set(path)
+            self.load_json_file(path)
 
     def search(self):
         file_path = self.file_var.get().strip()
         query = self.query_var.get().strip()
-        if not query:
-            messagebox.showinfo("Info","Enter a boolean query.")
-            return
-        self.set_status("Searching...")
-        for iid in self.search_tree.get_children():
-            self.search_tree.delete(iid)
+        status_msg = "Searching..." if query else "Loading data..."
+        self.set_status(status_msg)
+        self._populate_search_tree([])
         def work():
             try:
-                lines = json_search_load(file_path, query)  # formatted lines
-                lines = [l for l in lines if l and not is_ignored(get_ip_only(l))]
-                rows = [parse_formatted_line(l) for l in lines]  # (ip,motd,players,version)
-                self.search_rows = rows
-                def insert_all():
-                    for (ip, motd, players, version) in rows:
-                        self.search_tree.insert("", "end", values=(ip, motd, players, version))
-                self.after(0, insert_all)
-                self.set_status(f"{len(rows)} result(s).")
+                if not self.json_entries or self._loaded_json_path != file_path:
+                    entries, rows = self._load_json_data(file_path)
+                    self.json_entries = entries
+                    self.all_rows = rows
+                    self._loaded_json_path = file_path
+                if not query:
+                    rows = json_entries_to_rows(self.json_entries)
+                    self.all_rows = rows
+                    result_message = f"Showing all {len(rows)} entrie(s)."
+                else:
+                    filtered = filter_entries_JSON(self.json_entries, query)
+                    rows = []
+                    seen = set()
+                    for line in filtered:
+                        ip, motd, players, version = parse_formatted_line(line)
+                        ip = get_ip_only(ip)
+                        if not is_valid_ip_port(ip) or is_ignored(ip) or ip in seen:
+                            continue
+                        rows.append((ip, motd, players, version))
+                        seen.add(ip)
+                    result_message = f"{len(rows)} result(s)."
+                def update():
+                    self.search_rows = list(rows)
+                    if not query:
+                        self.all_rows = list(rows)
+                    self._populate_search_tree(rows)
+                    self.set_status(result_message)
+                self.after(0, update)
+            except FileNotFoundError:
+                self.after(0, lambda: self.set_status(f"File not found: {file_path}"))
             except Exception as e:
-                self.set_status(f"Search failed: {e}")
+                self.after(0, lambda: self.set_status(f"Search failed: {e}"))
         threading.Thread(target=work, daemon=True).start()
 
     def _search_selected_rows(self):  #
@@ -2242,7 +2485,8 @@ class _ReasonFileTab(ttk.Frame):
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=16, selectmode="extended")
         for c in cols:
             self.tree.heading(c, text=c.upper())
-            self.tree.column(c, width=240 if c == "ip" else 600, anchor="w")
+            width = 240 if c == "ip" else 600
+            self.tree.column(c, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         sb.pack(side="left", fill="y")
@@ -2334,7 +2578,15 @@ class IpLogTab(ttk.Frame):
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=16, selectmode="extended")
         for c in cols:
             self.tree.heading(c, text=c.upper())
-            self.tree.column(c, width=220 if c=="motd" else 160, anchor="w")
+            if c == "motd":
+                width = 240
+            elif c == "players":
+                width = 120
+            elif c == "version":
+                width = 120
+            else:
+                width = 170
+            self.tree.column(c, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         sb.pack(side="left", fill="y")
@@ -2396,6 +2648,142 @@ class IpLogTab(ttk.Frame):
             if v: ips.append(v[0])
         if not ips: return
         self.clipboard_clear(); self.clipboard_append("\n".join(ips))
+
+
+class UserLogTab(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._manager = None
+        self._refresh_pending = False
+        self._cached_entries = []
+        self._build_ui()
+
+    def _build_ui(self):
+        bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=8)
+        ttk.Button(bar, text="Copy Player(s)", command=self.copy_players).pack(side="left", padx=2)
+        ttk.Button(bar, text="Copy IP(s)", command=self.copy_ips).pack(side="left", padx=2)
+        ttk.Button(bar, text="Export Log…", command=self.export_log).pack(side="left", padx=8)
+
+        mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        cols = ("player", "ip", "motd", "last_seen")
+        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=18, selectmode="extended")
+        for c in cols:
+            self.tree.heading(c, text=c.upper())
+            if c == "motd":
+                width = 360
+            elif c == "ip":
+                width = 170
+            elif c == "last_seen":
+                width = 170
+            else:
+                width = 200
+            self.tree.column(c, width=width, anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        sb.pack(side="left", fill="y")
+        self.tree.config(yscrollcommand=sb.set)
+
+        make_tree_sortable(self.tree, {
+            "player": lambda v: str(v).lower(),
+            "ip": _ip_key,
+            "motd": lambda v: str(v).lower(),
+            "last_seen": lambda v: str(v)
+        })
+
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0,8))
+
+    def bind_manager(self, manager: UserLogManager):
+        self._manager = manager
+
+    def request_refresh(self, initial=False):
+        if not self._manager:
+            return
+        if self._refresh_pending and not initial:
+            return
+        self._refresh_pending = True
+        try:
+            self.after(0, self._refresh_from_manager)
+        except Exception:
+            self._refresh_pending = False
+
+    def _refresh_from_manager(self):
+        if not self._manager:
+            self._refresh_pending = False
+            return
+        entries = self._manager.snapshot()
+        entries.sort(key=lambda e: e["last_seen"], reverse=True)
+        self.tree.delete(*self.tree.get_children())
+        for entry in entries:
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    entry["player"],
+                    entry["ip"],
+                    entry["motd"],
+                    self._format_last_seen(entry["last_seen"])
+                )
+            )
+        self._cached_entries = entries
+        self.status.set(f"Tracking {len(entries)} player(s).")
+        self._refresh_pending = False
+
+    def _format_last_seen(self, ts):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except Exception:
+            return "-"
+
+    def _selected_rows(self):
+        rows = []
+        for iid in self.tree.selection():
+            vals = self.tree.item(iid, "values")
+            if vals:
+                rows.append(vals)
+        return rows
+
+    def copy_players(self):
+        rows = self._selected_rows()
+        if not rows:
+            messagebox.showinfo("User Log", "Select one or more rows.")
+            return
+        players = [row[0] for row in rows]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(players))
+        self.status.set(f"Copied {len(players)} player(s).")
+
+    def copy_ips(self):
+        rows = self._selected_rows()
+        if not rows:
+            messagebox.showinfo("User Log", "Select one or more rows.")
+            return
+        ips = [row[1] for row in rows]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(ips))
+        self.status.set(f"Copied {len(ips)} IP(s).")
+
+    def export_log(self):
+        if not self._cached_entries:
+            messagebox.showinfo("User Log", "Nothing to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export User Log",
+            defaultextension=".txt",
+            filetypes=[("Text files","*.txt")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for entry in self._cached_entries:
+                    ts = self._format_last_seen(entry["last_seen"])
+                    motd = sanitize_motd(entry["motd"])
+                    f.write(f"{entry['player']} | {entry['ip']} | Last Seen: {ts} | MOTD: {motd}\n")
+            self.status.set(f"Exported {len(self._cached_entries)} player(s) to {os.path.basename(path)}.")
+        except Exception as e:
+            self.status.set(f"Export failed: {e}")
+            messagebox.showerror("User Log", f"Export failed: {e}")
 
 
 
