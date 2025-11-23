@@ -45,6 +45,8 @@ IGNORE_FILE = "ignore.txt"
 SAVED_FILE = "saved.txt"
 DEFAULT_JSONL_FILE = "minecraft_servers.json"
 USER_LOG_FILE = "user_log.json"
+SERVER_MONITOR_FILE = "server_monitor_log.json"
+DEFAULT_MONITOR_INTERVAL = 60
 
 ICON_ENABLED = True           
 ICON_SIZE = 24                
@@ -594,6 +596,126 @@ def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None):
 
     return results, online_lines
 
+# ==================== Server Monitor State ====================
+
+def load_server_monitor_state():
+    if not os.path.exists(SERVER_MONITOR_FILE):
+        return {"servers": {}}
+    try:
+        with open(SERVER_MONITOR_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"servers": {}}
+    if not isinstance(data, dict):
+        return {"servers": {}}
+    data.setdefault("servers", {})
+    return data
+
+def save_server_monitor_state(state):
+    try:
+        with open(SERVER_MONITOR_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+def _ensure_monitor_server_entry(state, ip):
+    if "servers" not in state:
+        state["servers"] = {}
+    entries = state["servers"]
+    if ip not in entries:
+        entries[ip] = {
+            "ip": ip,
+            "motd": "",
+            "last_status": "unknown",
+            "last_ping": 0,
+            "players_online": 0,
+            "max_players": 0,
+            "version": "N/A",
+            "cracked": False,
+            "player_log": {}
+        }
+    return entries[ip]
+
+def update_server_monitor_entry(state, ip, result, timestamp):
+    entry = _ensure_monitor_server_entry(state, ip)
+    entry["motd"] = result.get("motd", "")
+    entry["version"] = result.get("version", "N/A")
+    entry["players_online"] = result.get("players", 0)
+    entry["max_players"] = result.get("max_players", 0)
+    entry["last_status"] = "online"
+    entry["last_ping"] = timestamp
+    entry["cracked"] = bool(result.get("cracked"))
+    sample = result.get("players_sample") or []
+    log = entry.setdefault("player_log", {})
+    for player_id, player_name in sample:
+        uid = (player_id or "").strip()
+        name = (player_name or "").strip()
+        if not uid or not name:
+            continue
+        log[uid] = {"name": name, "last_seen": timestamp}
+
+def mark_server_offline_in_state(state, ip, timestamp):
+    entry = _ensure_monitor_server_entry(state, ip)
+    entry["last_status"] = "offline"
+    entry["last_ping"] = timestamp
+
+def format_timestamp(ts):
+    if not ts:
+        return "n/a"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(ts)
+
+SERVER_MONITOR_TAB_INSTANCE = None
+
+def register_monitor_tab(tab):
+    global SERVER_MONITOR_TAB_INSTANCE
+    SERVER_MONITOR_TAB_INSTANCE = tab
+
+def add_ips_to_monitor_list(ips):
+    if not ips:
+        return 0, 0, 0
+    state = load_server_monitor_state()
+    added = 0
+    invalid = 0
+    duplicates = 0
+    for raw in ips:
+        ip = get_ip_only(raw)
+        if not ip or not is_valid_ip_port(ip):
+            invalid += 1
+            continue
+        if ip in state.get("servers", {}):
+            duplicates += 1
+            continue
+        _ensure_monitor_server_entry(state, ip)
+        added += 1
+    if added:
+        save_server_monitor_state(state)
+        if SERVER_MONITOR_TAB_INSTANCE:
+            try:
+                SERVER_MONITOR_TAB_INSTANCE.reload_state()
+            except Exception:
+                pass
+    return added, invalid, duplicates
+
+def format_monitor_feedback(added, invalid, duplicates):
+    if added:
+        parts = [f"Added {added} server(s) to monitor list."]
+        if duplicates:
+            parts.append(f"{duplicates} already monitored.")
+        if invalid:
+            parts.append(f"{invalid} invalid entrie(s) skipped.")
+        return " ".join(parts)
+    parts = []
+    if duplicates:
+        parts.append(f"{duplicates} already monitored.")
+    if invalid:
+        parts.append(f"{invalid} invalid entrie(s) skipped.")
+    if parts:
+        return " ".join(parts)
+    return "No new servers were added to the monitor list."
+
 # ==================== NBT Export ====================
 
 def list_txt_files():
@@ -1129,23 +1251,25 @@ class FullAppGUI(tk.Tk):  #
         nb.pack(fill="both", expand=True)
 
         # Tabs
-        self.servers_tab = ServersTab(nb)
         self.shodan_tab = ShodanTab(nb)
         self.json_tab = JSONTab(nb)
+        self.servers_tab = ServersTab(nb)
         self.import_tab = ExportTab(nb)
         self.saved_tab = SavedTab(nb)    
         self.ignore_tab = IgnoreTab(nb)  
         self.iplog_tab = IpLogTab(nb)    
         self.user_log_tab = UserLogTab(nb)
+        self.monitor_tab = ServerMonitorTab(nb)
 
-        nb.add(self.servers_tab, text="Servers")
         nb.add(self.shodan_tab, text="Shodan")
         nb.add(self.json_tab, text="JSON Search")
+        nb.add(self.servers_tab, text="Servers")
         nb.add(self.import_tab, text="Export To MC")
         nb.add(self.saved_tab, text="Saved List")  
         nb.add(self.ignore_tab, text="Ignore List")
         nb.add(self.iplog_tab, text="IP Log")     
         nb.add(self.user_log_tab, text="User Log")
+        nb.add(self.monitor_tab, text="Server Monitor")
 
         USER_LOG_MANAGER.attach_tab(self.user_log_tab)
 
@@ -1161,7 +1285,7 @@ class ServersTab(ttk.Frame):  #
         self._current_scan_ip = None 
 
     def add_ignore(self):  #
-        sel = self.get_selected_ips()
+        sel = self._selected_ips_any()
         if not sel:
             messagebox.showinfo("Info","Select one or more.")
             return
@@ -1179,7 +1303,7 @@ class ServersTab(ttk.Frame):  #
         self.set_status(f"Added {len(sel)} to ignore.txt")
 
     def add_saved(self):  #
-        sel = self.get_selected_ips()
+        sel = self._selected_ips_any()
         if not sel:
             messagebox.showinfo("Info","Select one or more.")
             return
@@ -1248,6 +1372,7 @@ class ServersTab(ttk.Frame):  #
         ttk.Button(right, text="Copy IP", command=self.copy_ip).pack(fill="x", pady=2)
         ttk.Button(right, text="Add to Ignore", command=self.add_ignore).pack(fill="x", pady=2)
         ttk.Button(right, text="Add to Saved", command=self.add_saved).pack(fill="x", pady=2)
+        ttk.Button(right, text="Add to Monitor", command=self.add_search_selected_to_monitor).pack(fill="x", pady=2)
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Button(right, text="Scan Selected", command=self.scan_selected).pack(fill="x", pady=2)
         ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
@@ -1301,6 +1426,7 @@ class ServersTab(ttk.Frame):  #
         ttk.Button(res_btns, text="Copy IP(s)", command=self.copy_scan_selected).pack(side="left", padx=4)
         ttk.Button(res_btns, text="Add to Ignore", command=self.ignore_scan_selected).pack(side="left", padx=4)
         ttk.Button(res_btns, text="Add to Saved", command=self.save_scan_selected).pack(side="left", padx=4)
+        ttk.Button(res_btns, text="Add to Monitor", command=self.add_scan_selected_to_monitor).pack(side="left", padx=4)
         ttk.Button(res_btns, text="Export Scan…", command=self.export_scan_results).pack(side="left", padx=4)
         self.player_search_var = tk.StringVar()
         search_entry = ttk.Entry(res_btns, textvariable=self.player_search_var, width=18)
@@ -1363,18 +1489,28 @@ class ServersTab(ttk.Frame):  #
         except Exception as e:
             messagebox.showerror("Load error", str(e))
 
-    def get_selected_ips(self):
-        # read from source_tree
+    def _selected_ips_from_tree(self, tree):
         sel = []
-        for iid in self.source_tree.selection():
-            vals = self.source_tree.item(iid, "values")
+        for iid in tree.selection():
+            vals = tree.item(iid, "values")
             if vals:
                 sel.append(vals[0])
-        # de-duplicate
-        return list(dict.fromkeys(sel))
+        return sel
+
+    def _selected_ips_any(self):
+        ips = []
+        ips.extend(self._selected_ips_from_tree(self.source_tree))
+        for vals in self._scan_selected_rows():
+            if vals:
+                ips.append(vals[0])
+        seen = []
+        for ip in ips:
+            if ip not in seen:
+                seen.append(ip)
+        return seen
 
     def copy_ip(self):
-        sel = self.get_selected_ips()
+        sel = self._selected_ips_any()
         if not sel:
             messagebox.showinfo("Info","Select one or more.")
             return
@@ -1425,6 +1561,15 @@ class ServersTab(ttk.Frame):  #
         for ip, *_ in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt from results.")
+
+    def add_scan_selected_to_monitor(self):
+        rows = self._scan_selected_rows()
+        if not rows:
+            messagebox.showinfo("Info", "Select results first.")
+            return
+        ips = [row[0] for row in rows]
+        added, invalid, duplicates = add_ips_to_monitor_list(ips)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
     def export_scan_results(self):  
         rows = []
@@ -1532,7 +1677,7 @@ class ServersTab(ttk.Frame):  #
         threading.Thread(target=work, daemon=True).start()
 
     def scan_selected(self):
-        sel = self.get_selected_ips()
+        sel = self._selected_ips_any()
         if not sel:
             messagebox.showinfo("Info","Select one or more.")
             return
@@ -1543,6 +1688,395 @@ class ServersTab(ttk.Frame):  #
             messagebox.showinfo("Info","Load a .txt first.")
             return
         self._scan(self.servers)
+
+
+def _servers_tab_add_search_selected_to_monitor(self):
+    sel = self._selected_ips_any()
+    if not sel:
+        messagebox.showinfo("Info","Select items first.")
+        return
+    added, invalid, duplicates = add_ips_to_monitor_list(sel)
+    self.set_status(format_monitor_feedback(added, invalid, duplicates))
+
+
+ServersTab.add_search_selected_to_monitor = _servers_tab_add_search_selected_to_monitor
+
+class ServerMonitorTab(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.monitor_state = load_server_monitor_state()
+        self.interval_var = tk.IntVar(value=DEFAULT_MONITOR_INTERVAL)
+        self.status_var = tk.StringVar(value="Monitor idle.")
+        self._monitor_thread = None
+        self._monitoring = False
+        self._monitor_interval = DEFAULT_MONITOR_INTERVAL
+        self._stop_event = threading.Event()
+        self._last_selected_ip = None
+        self._build_ui()
+        register_monitor_tab(self)
+        self._refresh_server_tree()
+        self._refresh_players_tree()
+
+    def _build_ui(self):
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        input_frame = ttk.Frame(self)
+        input_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        input_frame.columnconfigure(0, weight=1)
+        ttk.Label(input_frame, text="Add servers (one IP:PORT per line):").grid(row=0, column=0, sticky="w")
+        self.server_input = tk.Text(input_frame, height=3, wrap="none")
+        self.server_input.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        input_scroll = ttk.Scrollbar(input_frame, orient="vertical", command=self.server_input.yview)
+        input_scroll.grid(row=1, column=1, sticky="ns")
+        self.server_input.configure(yscrollcommand=input_scroll.set)
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(btn_frame, text="Add to Monitor", command=self.add_servers_from_input).pack(side="left")
+        ttk.Button(btn_frame, text="Clear Input", command=self.clear_input).pack(side="left", padx=6)
+        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_selected_servers).pack(side="left")
+        ttk.Button(btn_frame, text="Copy Selected", command=self.copy_monitored_ips).pack(side="left", padx=6)
+
+        control_frame = ttk.Frame(self)
+        control_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        control_frame.columnconfigure(6, weight=1)
+        ttk.Label(control_frame, text="Ping interval (secs):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(control_frame, width=6, textvariable=self.interval_var).grid(row=0, column=1, sticky="w", padx=(4, 12))
+        self.start_btn = ttk.Button(control_frame, text="Start Monitoring", command=self.start_monitoring)
+        self.start_btn.grid(row=0, column=2, padx=4)
+        self.stop_btn = ttk.Button(control_frame, text="Stop", command=self.stop_monitoring, state="disabled")
+        self.stop_btn.grid(row=0, column=3, padx=4)
+        ttk.Button(control_frame, text="Export Player Log", command=self.export_players).grid(row=0, column=4, padx=4)
+
+        main_pane = tk.PanedWindow(self, orient="vertical", sashwidth=8)
+        main_pane.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
+        main_pane.rowconfigure(0, weight=1)
+        main_pane.columnconfigure(0, weight=1)
+
+        server_frame = ttk.Frame(main_pane)
+        server_frame.rowconfigure(0, weight=1)
+        server_frame.columnconfigure(0, weight=1)
+        cols = ("ip", "status", "players", "version", "cracked", "motd", "last_ping")
+        self.server_tree = ttk.Treeview(server_frame, columns=cols, show="headings", height=10, selectmode="extended")
+        for col in cols:
+            self.server_tree.heading(col, text=col.replace("_", " ").title())
+            if col == "ip":
+                width = 150
+            elif col == "status":
+                width = 100
+            elif col == "players":
+                width = 110
+            elif col == "version":
+                width = 120
+            elif col == "cracked":
+                width = 90
+            elif col == "motd":
+                width = 260
+            else:
+                width = 170
+            self.server_tree.column(col, width=width, anchor="w")
+        self.server_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(server_frame, orient="vertical", command=self.server_tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.server_tree.configure(yscrollcommand=tree_scroll.set)
+        self.server_tree.bind("<<TreeviewSelect>>", lambda e: self._on_server_selected())
+        self.server_tree.tag_configure("status_offline", background="#ffe6e6")
+        make_tree_sortable(self.server_tree, {
+            "ip": _ip_key,
+            "status": lambda v: str(v).lower(),
+            "players": _players_key,
+            "version": _version_key,
+            "cracked": lambda v: 0 if str(v).lower() in ("false","no","0") else 1,
+            "motd": lambda v: str(v).lower(),
+            "last_ping": lambda v: v or ""
+        })
+        main_pane.add(server_frame, minsize=260)
+
+        players_frame = ttk.Frame(main_pane)
+        players_frame.rowconfigure(1, weight=1)
+        players_frame.columnconfigure(0, weight=1)
+        ttk.Label(players_frame, text="Recorded players for selected server:").grid(row=0, column=0, sticky="w", pady=(0,4))
+        player_cols = ("uuid", "name", "last_seen")
+        self.players_tree = ttk.Treeview(players_frame, columns=player_cols, show="headings", height=6)
+        for col in player_cols:
+            self.players_tree.heading(col, text=col.replace("_", " ").title())
+            if col == "uuid":
+                width = 260
+            elif col == "name":
+                width = 200
+            else:
+                width = 170
+            self.players_tree.column(col, width=width, anchor="w")
+        self.players_tree.grid(row=1, column=0, sticky="nsew")
+        player_scroll = ttk.Scrollbar(players_frame, orient="vertical", command=self.players_tree.yview)
+        player_scroll.grid(row=1, column=1, sticky="ns")
+        self.players_tree.configure(yscrollcommand=player_scroll.set)
+        btn_frame = ttk.Frame(players_frame)
+        btn_frame.grid(row=2, column=0, sticky="w", pady=(4,0))
+        ttk.Button(btn_frame, text="Copy Username(s)", command=self.copy_selected_player_names).pack(side="left")
+        main_pane.add(players_frame, minsize=160)
+
+        footer = ttk.Frame(self)
+        footer.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 8))
+        ttk.Label(footer, textvariable=self.status_var, anchor="w").pack(fill="x")
+
+    def _set_status(self, msg):
+        self.status_var.set(msg)
+
+    def add_servers_from_input(self):
+        raw = self.server_input.get("1.0", "end").strip()
+        if not raw:
+            self._set_status("Paste one or more servers first.")
+            return
+        added = 0
+        invalid = 0
+        for line in raw.splitlines():
+            ip = get_ip_only(line.strip())
+            if not ip:
+                continue
+            if not is_valid_ip_port(ip):
+                invalid += 1
+                continue
+            if ip in self.monitor_state.get("servers", {}):
+                continue
+            _ensure_monitor_server_entry(self.monitor_state, ip)
+            added += 1
+        if added:
+            save_server_monitor_state(self.monitor_state)
+            self._refresh_server_tree()
+            self._set_status(f"Added {added} server(s) to monitor list.")
+        elif invalid:
+            self._set_status("Skipped invalid entries.")
+        else:
+            self._set_status("No new servers added.")
+        self.server_input.delete("1.0", "end")
+
+    def clear_input(self):
+        self.server_input.delete("1.0", "end")
+        self._set_status("Input cleared.")
+
+    def remove_selected_servers(self):
+        selected = self.server_tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "Select rows to remove.")
+            return
+        removed = 0
+        for iid in selected:
+            vals = self.server_tree.item(iid, "values")
+            if not vals:
+                continue
+            ip = vals[0]
+            if ip in self.monitor_state.get("servers", {}):
+                self.monitor_state["servers"].pop(ip, None)
+                removed += 1
+        if removed:
+            save_server_monitor_state(self.monitor_state)
+            self._last_selected_ip = None
+            self._refresh_server_tree()
+            self._refresh_players_tree(None)
+            self._set_status(f"Removed {removed} server(s) from monitor list.")
+        else:
+            self._set_status("No servers removed.")
+
+    def copy_monitored_ips(self):
+        selected = self.server_tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "Select rows first.")
+            return
+        ips = []
+        for iid in selected:
+            vals = self.server_tree.item(iid, "values")
+            if vals:
+                ips.append(vals[0])
+        if not ips:
+            messagebox.showinfo("Info", "No valid IPs selected.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(ips))
+        self._set_status(f"Copied {len(ips)} monitored server(s).")
+
+    def copy_selected_player_names(self):
+        selected = self.players_tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "Select player rows first.")
+            return
+        names = []
+        for iid in selected:
+            vals = self.players_tree.item(iid, "values")
+            if vals and len(vals) >= 2:
+                name = vals[1]
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+        if not names:
+            messagebox.showinfo("Info", "No player names selected.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(names))
+        self._set_status(f"Copied {len(names)} player name(s).")
+
+    def start_monitoring(self):
+        if self._monitoring:
+            return
+        interval = self._read_interval()
+        if not interval:
+            messagebox.showinfo("Info", "Enter a valid interval (in seconds).")
+            return
+        ips = self._get_monitored_ips()
+        if not ips:
+            messagebox.showinfo("Info", "Add at least one server to monitor.")
+            return
+        self._monitor_interval = interval
+        self._stop_event.clear()
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+        self._monitoring = True
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self._set_status(f"Monitoring {len(ips)} server(s) every {interval}s.")
+
+    def stop_monitoring(self):
+        if not self._monitoring:
+            return
+        self._stop_event.set()
+        self._monitoring = False
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self._set_status("Monitoring paused.")
+
+    def _monitor_loop(self):
+        while not self._stop_event.is_set():
+            start = time.time()
+            try:
+                self._run_monitor_pass()
+            except Exception as exc:
+                self.after(0, lambda: self._set_status(f"Monitor error: {exc}"))
+            elapsed = time.time() - start
+            wait = max(0, self._monitor_interval - elapsed)
+            if self._stop_event.wait(wait):
+                break
+
+    def _run_monitor_pass(self):
+        ips = self._get_monitored_ips()
+        if not ips:
+            self.after(0, lambda: self._set_status("No servers configured to monitor."))
+            return
+        self.after(0, lambda: self._set_status(f"Pinging {len(ips)} server(s)..."))
+        cycle_ts = time.time()
+        results, _ = scan_servers_gui(ips)
+        processed = set()
+        for result in results:
+            ip = result.get("ip")
+            if not ip:
+                continue
+            update_server_monitor_entry(self.monitor_state, ip, result, cycle_ts)
+            processed.add(ip)
+        for ip in ips:
+            if ip not in processed:
+                mark_server_offline_in_state(self.monitor_state, ip, cycle_ts)
+        save_server_monitor_state(self.monitor_state)
+        self.after(0, self._refresh_server_tree)
+        self.after(0, self._refresh_players_tree)
+        self.after(0, lambda: self._set_status(f"Monitor cycle complete ({len(ips)} servers)."))
+
+    def export_players(self):
+        ip = self._last_selected_ip
+        if not ip:
+            messagebox.showinfo("Info", "Select a server first.")
+            return
+        entry = self.monitor_state.get("servers", {}).get(ip)
+        if not entry:
+            messagebox.showinfo("Info", "Server data unavailable.")
+            return
+        log = entry.get("player_log", {})
+        if not log:
+            messagebox.showinfo("Info", "No player data for this server yet.")
+            return
+        safe_name = ip.replace(":", "_")
+        path = filedialog.asksaveasfilename(
+            title="Export Player Log",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            initialfile=f"{safe_name}_players.txt"
+        )
+        if not path:
+            return
+        rows = sorted(log.items(), key=lambda kv: kv[1].get("last_seen", 0), reverse=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for uid, data in rows:
+                name = data.get("name", "")
+                seen = format_timestamp(data.get("last_seen"))
+                f.write(f"{uid} | {name} | Last seen: {seen}\n")
+        self._set_status(f"Exported {len(rows)} player entries for {ip}.")
+
+    def _get_monitored_ips(self):
+        return list(self.monitor_state.get("servers", {}).keys())
+
+    def _read_interval(self):
+        try:
+            val = int(self.interval_var.get())
+            return max(5, val)
+        except Exception:
+            return None
+
+    def _refresh_server_tree(self):
+        current = self._last_selected_ip
+        target_iid = None
+        self.server_tree.delete(*self.server_tree.get_children())
+        for ip in sorted(self.monitor_state.get("servers", {})):
+            entry = self.monitor_state["servers"][ip]
+            players = entry.get("players_online", 0)
+            max_players = entry.get("max_players", 0)
+            status = entry.get("last_status", "unknown")
+            last_ping = format_timestamp(entry.get("last_ping"))
+            version = entry.get("version", "N/A")
+            cracked = "Yes" if entry.get("cracked") else "No"
+            motd = sanitize_motd(entry.get("motd", ""))
+            iid = self.server_tree.insert(
+                "",
+                "end",
+                values=(ip, status.title(), f"{players}/{max_players}", version, cracked, motd, last_ping),
+                tags=("status_offline",) if status.strip().lower() != "online" and status.strip() else ()
+            )
+            if ip == current:
+                target_iid = iid
+        if target_iid:
+            self.server_tree.selection_set(target_iid)
+            self.server_tree.see(target_iid)
+
+    def _refresh_players_tree(self, ip=None):
+        if ip is None:
+            ip = self._last_selected_ip
+        self.players_tree.delete(*self.players_tree.get_children())
+        if not ip:
+            return
+        entry = self.monitor_state.get("servers", {}).get(ip)
+        if not entry:
+            return
+        rows = []
+        for uid, pdata in entry.get("player_log", {}).items():
+            rows.append((uid, pdata.get("name", ""), pdata.get("last_seen", 0)))
+        rows.sort(key=lambda item: item[2], reverse=True)
+        for uid, name, last_seen in rows:
+            self.players_tree.insert("", "end", values=(uid, name, format_timestamp(last_seen)))
+
+    def _on_server_selected(self):
+        selection = self.server_tree.selection()
+        if not selection:
+            self._last_selected_ip = None
+            self._refresh_players_tree(None)
+            return
+        vals = self.server_tree.item(selection[0], "values")
+        if not vals:
+            return
+        self._last_selected_ip = vals[0]
+        self._refresh_players_tree(self._last_selected_ip)
+    
+    def reload_state(self):
+        self.monitor_state = load_server_monitor_state()
+        if self._last_selected_ip not in self.monitor_state.get("servers", {}):
+            self._last_selected_ip = None
+        self._refresh_server_tree()
+        self._refresh_players_tree(self._last_selected_ip)
 
 # ---- Shodan Tab ----
 class ShodanTab(ttk.Frame):  
@@ -1610,6 +2144,7 @@ class ShodanTab(ttk.Frame):
         ttk.Button(right, text="Copy IP(s)", command=self.copy_selected).pack(fill="x", pady=2)
         ttk.Button(right, text="Add to Ignore", command=self.ignore_selected).pack(fill="x", pady=2)
         ttk.Button(right, text="Add to Saved", command=self.save_selected).pack(fill="x", pady=2)
+        ttk.Button(right, text="Add to Monitor", command=self.add_search_selected_to_monitor).pack(fill="x", pady=2)
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Button(right, text="Scan Selected", command=self.scan_selected).pack(fill="x", pady=2)
         ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
@@ -1661,6 +2196,7 @@ class ShodanTab(ttk.Frame):
         ttk.Button(obtns, text="Copy IP(s)", command=self.copy_scan_selected).pack(side="left", padx=4)
         ttk.Button(obtns, text="Add to Ignore", command=self.ignore_scan_selected_from_output).pack(side="left", padx=4)
         ttk.Button(obtns, text="Add to Saved", command=self.save_scan_selected_from_output).pack(side="left", padx=4)
+        ttk.Button(obtns, text="Add to Monitor", command=self.add_scan_output_selected_to_monitor).pack(side="left", padx=4)
         ttk.Button(obtns, text="Export Scan…", command=self.export_scan_output).pack(side="left", padx=4)
 
         self.status = tk.StringVar(value="Ready.")
@@ -1734,13 +2270,24 @@ class ShodanTab(ttk.Frame):
         return
 
 
-    def _selected_ips(self):
+    def _search_selected_ips(self):
         sel = []
         for iid in self.tree.selection():
             vals = self.tree.item(iid, "values")
             if vals:
                 sel.append(vals[0])
         return list(dict.fromkeys(sel))
+
+    def _all_selected_ips(self):
+        ips = self._search_selected_ips()
+        for vals in self._scan_selected_rows():
+            if vals:
+                ips.append(vals[0])
+        seen = []
+        for ip in ips:
+            if ip not in seen:
+                seen.append(ip)
+        return seen
 
     # ---- Scan Output helpers ----
     def _scan_selected_rows(self):  #
@@ -1762,7 +2309,7 @@ class ShodanTab(ttk.Frame):
         self.set_status(f"Copied {len(ips)} IP(s) from scan output.")
 
     def ignore_selected(self):  
-        sel = self._selected_ips()
+        sel = self._all_selected_ips()
         if not sel:
             messagebox.showinfo("Info","Select items first.")
             return
@@ -1777,7 +2324,7 @@ class ShodanTab(ttk.Frame):
         self.set_status(f"Added {len(sel)} to ignore.txt")
 
     def save_selected(self):  
-        sel = self._selected_ips()
+        sel = self._all_selected_ips()
         if not sel:
             messagebox.showinfo("Info","Select items first.")
             return
@@ -1785,6 +2332,14 @@ class ShodanTab(ttk.Frame):
         for ip in sel:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(sel)} to saved.txt")
+
+    def add_search_selected_to_monitor(self):
+        sel = self._all_selected_ips()
+        if not sel:
+            messagebox.showinfo("Info","Select items first.")
+            return
+        added, invalid, duplicates = add_ips_to_monitor_list(sel)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
     def ignore_scan_selected_from_output(self):
         rows = self._scan_selected_rows()
@@ -1810,6 +2365,15 @@ class ShodanTab(ttk.Frame):
         for ip, *_ in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt from scan output.")
+
+    def add_scan_output_selected_to_monitor(self):
+        rows = self._scan_selected_rows()
+        if not rows:
+            messagebox.showinfo("Info", "Select scan output rows.")
+            return
+        ips = [row[0] for row in rows]
+        added, invalid, duplicates = add_ips_to_monitor_list(ips)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
     def export_scan_output(self):  
         rows = []
@@ -1912,7 +2476,7 @@ class ShodanTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def scan_selected(self):  
-        sel = self._selected_ips()
+        sel = self._all_selected_ips()
         if not sel:
             messagebox.showinfo("Info","Select items in the table.")
             return
@@ -1926,7 +2490,7 @@ class ShodanTab(ttk.Frame):
         self._scan_and_show(all_ips)
 
     def copy_selected(self):
-        sel = self._selected_ips()
+        sel = self._all_selected_ips()
         if not sel:
             messagebox.showinfo("Info","Select items first.")
             return
@@ -2028,6 +2592,7 @@ class JSONTab(ttk.Frame):
         ttk.Button(right, text="Copy IP(s)", command=self.copy_ip).pack(fill="x", pady=2)
         ttk.Button(right, text="Add to Ignore", command=self.add_ignore).pack(fill="x", pady=2)
         ttk.Button(right, text="Add to Saved", command=self.add_saved).pack(fill="x", pady=2)
+        ttk.Button(right, text="Add to Monitor", command=self.add_search_selected_to_monitor).pack(fill="x", pady=2)
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Button(right, text="Scan Selected", command=self.scan_selected).pack(fill="x", pady=2)
         ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
@@ -2079,6 +2644,7 @@ class JSONTab(ttk.Frame):
         ttk.Button(obtns, text="Copy IP(s)", command=self.copy_scan_selected).pack(side="left", padx=4)
         ttk.Button(obtns, text="Add to Ignore", command=self.ignore_scan_selected).pack(side="left", padx=4)
         ttk.Button(obtns, text="Add to Saved", command=self.save_scan_selected).pack(side="left", padx=4)
+        ttk.Button(obtns, text="Add to Monitor", command=self.add_scan_output_selected_to_monitor).pack(side="left", padx=4)
         ttk.Button(obtns, text="Export Scan…", command=self.export_scan_output).pack(side="left", padx=4)
         self.player_search_var = tk.StringVar()
         search_entry = ttk.Entry(obtns, textvariable=self.player_search_var, width=18)
@@ -2182,12 +2748,25 @@ class JSONTab(ttk.Frame):
                 out.append(vals)
         return out
 
+    def _search_selected_ips(self):
+        return [row[0] for row in self._search_selected_rows() if row]
+
+    def _all_selected_ips(self):
+        ips = self._search_selected_ips()
+        for row in self._scan_selected_rows():
+            if row:
+                ips.append(row[0])
+        seen = []
+        for ip in ips:
+            if ip not in seen:
+                seen.append(ip)
+        return seen
+
     def copy_ip(self):
-        rows = self._search_selected_rows()
-        if not rows:
+        ips = self._all_selected_ips()
+        if not ips:
             messagebox.showinfo("Info","Select items first.")
             return
-        ips = [row[0] for row in rows]
         self.clipboard_clear()
         self.clipboard_append("\n".join(ips))
         self.set_status(f"Copied {len(ips)} IP(s).")
@@ -2223,6 +2802,23 @@ class JSONTab(ttk.Frame):
         for (ip, *_rest) in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt")
+
+    def add_search_selected_to_monitor(self):
+        ips = self._all_selected_ips()
+        if not ips:
+            messagebox.showinfo("Info","Select items first.")
+            return
+        added, invalid, duplicates = add_ips_to_monitor_list(ips)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
+
+    def add_search_selected_to_monitor(self):
+        rows = self._search_selected_rows()
+        if not rows:
+            messagebox.showinfo("Info","Select items first.")
+            return
+        ips = [row[0] for row in rows]
+        added, invalid, duplicates = add_ips_to_monitor_list(ips)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
     # ---- JSON scan-output helpers ----
     def _scan_selected_rows(self):
@@ -2301,11 +2897,10 @@ class JSONTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def scan_selected(self):
-        rows = self._search_selected_rows()
-        if not rows:
+        ips = self._all_selected_ips()
+        if not ips:
             messagebox.showinfo("Info","Select items first.")
             return
-        ips = [row[0] for row in rows]
         self._scan_and_show(ips)
 
     def scan_all(self):
@@ -2349,6 +2944,15 @@ class JSONTab(ttk.Frame):
         for (ip, *_rest) in rows:
             add_to_saved(ip, reason or "")
         self.set_status(f"Added {len(rows)} to saved.txt from scan output.")
+
+    def add_scan_output_selected_to_monitor(self):
+        rows = self._scan_selected_rows()
+        if not rows:
+            messagebox.showinfo("Info", "Select scan output rows.")
+            return
+        ips = [row[0] for row in rows]
+        added, invalid, duplicates = add_ips_to_monitor_list(ips)
+        self.set_status(format_monitor_feedback(added, invalid, duplicates))
 
     def export_search_results(self):  #
         if not self.search_rows:
@@ -2663,6 +3267,10 @@ class UserLogTab(ttk.Frame):
         ttk.Button(bar, text="Copy Player(s)", command=self.copy_players).pack(side="left", padx=2)
         ttk.Button(bar, text="Copy IP(s)", command=self.copy_ips).pack(side="left", padx=2)
         ttk.Button(bar, text="Export Log…", command=self.export_log).pack(side="left", padx=8)
+        self.user_search_var = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.user_search_var, width=20).pack(side="left", padx=(4,4))
+        ttk.Button(bar, text="Search Player", command=self.search_player_log).pack(side="left", padx=4)
+        ttk.Button(bar, text="Clear Search", command=self.clear_player_log_search).pack(side="left", padx=4)
 
         mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=8, pady=(0,8))
         cols = ("player", "ip", "motd", "last_seen")
@@ -2713,6 +3321,12 @@ class UserLogTab(ttk.Frame):
             return
         entries = self._manager.snapshot()
         entries.sort(key=lambda e: e["last_seen"], reverse=True)
+        self._cached_entries = list(entries)
+        self._populate_user_tree(entries)
+        self.status.set(f"Tracking {len(entries)} player(s).")
+        self._refresh_pending = False
+
+    def _populate_user_tree(self, entries):
         self.tree.delete(*self.tree.get_children())
         for entry in entries:
             self.tree.insert(
@@ -2725,9 +3339,23 @@ class UserLogTab(ttk.Frame):
                     self._format_last_seen(entry["last_seen"])
                 )
             )
-        self._cached_entries = entries
-        self.status.set(f"Tracking {len(entries)} player(s).")
-        self._refresh_pending = False
+
+    def search_player_log(self):
+        query = (self.user_search_var.get() or "").strip().lower()
+        if not query:
+            self.set_status("Enter a player name to search.")
+            return
+        matches = [
+            entry for entry in self._cached_entries
+            if query in (entry.get("player") or "").lower()
+        ]
+        self._populate_user_tree(matches)
+        self.set_status(f"{len(matches)} match(es) for '{self.user_search_var.get().strip()}'.")
+
+    def clear_player_log_search(self):
+        self.user_search_var.set("")
+        self._populate_user_tree(self._cached_entries)
+        self.set_status(f"Tracking {len(self._cached_entries)} player(s).")
 
     def _format_last_seen(self, ts):
         try:
