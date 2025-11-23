@@ -20,6 +20,7 @@ A desktop GUI for discovering and testing Minecraft servers. It searches Shodan,
 - **Shows Players:** You can see and search who's currently playing on the detected servers.
 - **Logs Players:** Keeps a list of all discovered players and the last server they were in.
 - **Cracked:** Shows which servers are cracked.
+- **Server Monitor**: Monitors selected servers every minute and logs all players.
 
 ---
 
@@ -60,7 +61,11 @@ A desktop GUI for discovering and testing Minecraft servers. It searches Shodan,
 - Allows you to see their last known server location
 - Can export the data or copy specific IP addresses or usernames
 
-  
+### Server Monitor
+- Add servers to a list to be monitored
+- Set a time to ping and grab server info (default 1 minute)
+- Players for each server will be saved and new players will be added to the list
+
 ---
 
 ## Boolean search (JSON tab)
