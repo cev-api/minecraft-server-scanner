@@ -6,6 +6,7 @@ import struct
 import json
 import re
 import os
+import random
 import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,7 @@ except Exception:
     _PIL_AVAILABLE = False
 import hashlib
 import uuid
+import zlib
 
 init(autoreset=True)
 
@@ -47,6 +49,62 @@ DEFAULT_JSONL_FILE = "minecraft_servers.json"
 USER_LOG_FILE = "user_log.json"
 SERVER_MONITOR_FILE = "server_monitor_log.json"
 DEFAULT_MONITOR_INTERVAL = 60
+CRACKED_CACHE_FILE = "known_cracked_servers.json"
+CRACKED_LOG_FILE = "cracked_scan.log"
+CRACKED_VERIFY_WORKERS = 10
+
+_CRACKED_CACHE_LOCK = threading.Lock()
+
+def _load_cracked_cache():
+    if not os.path.exists(CRACKED_CACHE_FILE):
+        return {}
+    try:
+        with open(CRACKED_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+_CRACKED_CACHE = _load_cracked_cache()
+
+def _save_cracked_cache_locked():
+    try:
+        with open(CRACKED_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_CRACKED_CACHE, f, indent=2)
+    except Exception:
+        pass
+
+def get_cached_cracked_entry(ip_port):
+    with _CRACKED_CACHE_LOCK:
+        entry = _CRACKED_CACHE.get(ip_port)
+        return dict(entry) if entry else None
+
+def record_cracked_server(ip_port, message="", extra=None):
+    data = {
+        "message": message or "",
+        "first_seen": time.time(),
+        "last_seen": time.time()
+    }
+    if isinstance(extra, dict):
+        data.update({
+            "motd": extra.get("motd", ""),
+            "version": extra.get("version", ""),
+            "players": extra.get("players", 0),
+            "max_players": extra.get("max_players", 0)
+        })
+    with _CRACKED_CACHE_LOCK:
+        existing = _CRACKED_CACHE.get(ip_port)
+        if existing:
+            data["first_seen"] = existing.get("first_seen", data["first_seen"])
+        _CRACKED_CACHE[ip_port] = data
+        _save_cracked_cache_locked()
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = f"{ts} | {ip_port} | {message or 'CRACKED'}\n"
+        with open(CRACKED_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 ICON_ENABLED = True           
 ICON_SIZE = 24                
@@ -54,6 +112,15 @@ ICON_COL_EXTRA_PAD = 24
 ICON_FETCH_TIMEOUT = 2        
 ICON_THREADS = 10             
 ICON_PLACEHOLDER = "#ffffff"  
+SKIP_CRACKED_VERSION_KEYWORDS = tuple(
+    s.lower() for s in (
+        "proxy",
+        "e4mc",
+        "maintenance",
+        "maintainance",
+        "§4maintenance"
+    )
+)
 
 
 # ========================================
@@ -212,6 +279,19 @@ def sanitize_motd(m):
     m = re.sub(r"§[0-9A-FK-ORa-fk-or]", "", m)  # strip legacy MC color/style codes
     return re.sub(r"\s+", " ", m.replace("\r", " ").replace("\n", " ")).strip()
 
+def should_skip_cracked_probe(entry):
+    """
+    Heuristic skip for proxies/non-standard servers that hang the faux login phase.
+    """
+    version_raw = (entry.get("version") or "")
+    version_norm = version_raw.strip().lower()
+    version_plain = sanitize_motd(version_raw).lower()
+    if version_norm:
+        for key in SKIP_CRACKED_VERSION_KEYWORDS:
+            if key in version_norm or key in version_plain:
+                return True
+    return False
+
 
 # ==================== SHODAN ====================
 
@@ -297,6 +377,57 @@ def split_host_port(entry):
     if match:
         return match.group(1), int(match.group(2))
     raise ValueError(f"Invalid entry format: {entry}")
+
+def _probe_cracked_entry(entry):
+    ip = entry.get("ip")
+    if not ip:
+        return None, "Missing IP"
+    try:
+        host, port = split_host_port(ip)
+    except ValueError as exc:
+        return None, str(exc)
+    result, message = is_cracked_server(host, port)
+    return result, message
+
+def run_cracked_verifier_async(entries, callback, progress_cb=None):
+    """
+    entries: list of ping_server dicts.
+    callback(entry, result, message, was_cached) invoked from the worker thread.
+    progress_cb(done, total) invoked after each entry is processed.
+    """
+    def worker():
+        total = len(entries)
+        completed = 0
+        pending = []
+        for entry in entries:
+            ip = entry.get("ip")
+            cached = get_cached_cracked_entry(ip)
+            if cached:
+                callback(entry, True, cached.get("message") or "Cached cracked server", True)
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, total)
+            else:
+                pending.append(entry)
+        if not pending:
+            return
+        with ThreadPoolExecutor(max_workers=CRACKED_VERIFY_WORKERS) as executor:
+            future_to_entry = {executor.submit(_probe_cracked_entry, entry): entry for entry in pending}
+            for fut in as_completed(future_to_entry):
+                entry = future_to_entry[fut]
+                try:
+                    result, message = fut.result()
+                except Exception as exc:
+                    result, message = None, str(exc)
+                if result is True:
+                    record_cracked_server(entry.get("ip"), message, extra=entry)
+                callback(entry, result, message, False)
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, total)
+    if not entries:
+        return
+    threading.Thread(target=worker, daemon=True).start()
 
 # ==================== PING ====================
 
@@ -429,6 +560,254 @@ def format_player_list(sample):
     return ", ".join(names) if names else "-"
 
 
+# ==================== CRACKED SERVER CHECKER ====================
+
+PACKET_LENGTH_LIMIT_LOGIN = 100000
+DEFAULT_STATUS_PROTOCOL = 773
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,16}$")
+
+def recv_varint(sock):
+    value = 0
+    shift = 0
+    while True:
+        raw = sock.recv(1)
+        if not raw:
+            raise ConnectionError("Socket closed while reading varint")
+        byte = raw[0]
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            return value
+        shift += 7
+        if shift > 35:
+            raise ValueError("Varint too big")
+
+def recv_exact(sock, length):
+    data = b""
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise ConnectionError("Socket closed while reading data")
+        data += chunk
+    return data
+
+def recv_mc_string(sock):
+    length = recv_varint(sock)
+    raw = recv_exact(sock, length)
+    return raw.decode("utf-8", errors="ignore")
+
+def read_varint_from_bytes(buf, pos):
+    value = 0
+    shift = 0
+    while True:
+        if pos >= len(buf):
+            raise ValueError("Buffer ended while reading varint")
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not (byte & 0x80):
+            break
+        shift += 7
+        if shift > 35:
+            raise ValueError("Varint too big in buffer")
+    return value, pos
+
+def read_mc_string_from_bytes(buf, pos):
+    length, pos = read_varint_from_bytes(buf, pos)
+    end = pos + length
+    if end > len(buf):
+        raise ValueError("String length outside buffer")
+    raw = buf[pos:end]
+    pos = end
+    return raw.decode("utf-8", errors="ignore"), pos
+
+def offline_uuid_nodash(name):
+    h = hashlib.md5()
+    h.update(b"OfflinePlayer:")
+    h.update(name.encode("utf-8"))
+    data = bytearray(h.digest())
+    data[6] = (data[6] & 0x0F) | 0x30
+    data[8] = (data[8] & 0x3F) | 0x80
+    return uuid.UUID(bytes=bytes(data)).hex
+
+def get_server_status_info(host, port=25565):
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=4)
+        handshake = (
+            varint_encode(0) +
+            varint_encode(DEFAULT_STATUS_PROTOCOL) +
+            write_string(host) +
+            struct.pack(">H", port) +
+            varint_encode(1)
+        )
+        sock.sendall(varint_encode(len(handshake)) + handshake)
+        sock.sendall(varint_encode(1) + b"\x00")
+
+        _ = recv_varint(sock)
+        _ = recv_varint(sock)
+        json_length = recv_varint(sock)
+        status_json = recv_exact(sock, json_length).decode("utf-8", errors="ignore")
+        data = json.loads(status_json)
+
+        proto = data.get("version", {}).get("protocol", DEFAULT_STATUS_PROTOCOL)
+
+        sample_names = []
+        sample_hint = None
+        players = data.get("players") or {}
+        samples = players.get("sample") or []
+        any_sample = False
+        any_offline_match = False
+        for player in samples:
+            name = player.get("name")
+            pid = player.get("id")
+            if not name or not pid:
+                continue
+            any_sample = True
+            sample_names.append(name)
+            offline_id = offline_uuid_nodash(name)
+            reported = pid.replace("-", "").lower()
+            if offline_id == reported:
+                any_offline_match = True
+
+        if any_sample:
+            sample_hint = True if any_offline_match else False
+        else:
+            sample_hint = None
+
+        return proto, sample_names, sample_hint
+    except Exception:
+        return DEFAULT_STATUS_PROTOCOL, [], None
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+def get_server_protocol(host, port=25565):
+    proto, _, _ = get_server_status_info(host, port)
+    return proto
+
+def build_login_start(username, protocol):
+    body = varint_encode(0)
+    body += write_string(username)
+    if protocol >= 759:
+        uid = uuid.uuid4()
+        body += uid.int.to_bytes(16, "big")
+    return body
+
+def pick_username(sample_names):
+    valid = [name for name in sample_names if USERNAME_PATTERN.match(name)]
+    if valid:
+        return random.choice(valid)
+    return "Notch"
+
+def login_probe(host, port=25565):
+    protocol, sample_names, sample_offline_hint = get_server_status_info(host, port)
+    username = pick_username(sample_names)
+    sock = None
+    saw_encryption_request = False
+    compression_threshold = -1
+
+    try:
+        sock = socket.create_connection((host, port), timeout=6)
+        sock.settimeout(2.0)
+
+        handshake = (
+            varint_encode(0) +
+            varint_encode(protocol) +
+            write_string(host) +
+            struct.pack(">H", port) +
+            varint_encode(2)
+        )
+        sock.sendall(varint_encode(len(handshake)) + handshake)
+        login_start = build_login_start(username, protocol)
+        sock.sendall(varint_encode(len(login_start)) + login_start)
+
+        while True:
+            packet_length = recv_varint(sock)
+            if packet_length > PACKET_LENGTH_LIMIT_LOGIN:
+                raise ValueError("Packet too large")
+            packet_data = recv_exact(sock, packet_length)
+
+            if compression_threshold >= 0:
+                data_len, pos = read_varint_from_bytes(packet_data, 0)
+                if data_len == 0:
+                    buf = packet_data[pos:]
+                else:
+                    buf = zlib.decompress(packet_data[pos:])
+            else:
+                buf = packet_data
+                pos = 0
+
+            packet_id, pos = read_varint_from_bytes(buf, 0)
+
+            if packet_id == 0x03:
+                threshold, _ = read_varint_from_bytes(buf, pos)
+                compression_threshold = threshold
+                continue
+
+            if packet_id == 0x01:  # Encryption Request
+                saw_encryption_request = True
+                if sample_offline_hint is True:
+                    return True, "CRACKED by players.sample UUID (but got Encryption Request; mixed signals)"
+                return False, "ONLINE-MODE (Mojang auth required)"
+
+            if packet_id == 0x02:  # Login Success
+                msg = f"CRACKED (offline-mode) - login success as {username}"
+                if sample_offline_hint is True:
+                    msg += " [players.sample also indicates offline-mode]"
+                elif sample_offline_hint is False:
+                    msg += " [players.sample looks online-mode]"
+                return True, msg
+
+            if packet_id == 0x04:  # Login Plugin Request
+                is_offline = (not saw_encryption_request) or (sample_offline_hint is True)
+                if is_offline:
+                    return True, "CRACKED (offline-mode behind proxy/login plugin)"
+                return False, "ONLINE-MODE + login plugin (secure/proxied)"
+
+            if packet_id == 0x00:  # Disconnect
+                reason, _ = read_mc_string_from_bytes(buf, pos)
+                low = (reason or "").lower()
+                clean = sanitize_motd(reason).lower()
+                if "whitelist" in clean or "white list" in clean:
+                    return True, f"CRACKED (whitelist message: {sanitize_motd(reason)})"
+                if "outdated client" in low or "outdated server" in low:
+                    return None, "VERSION MISMATCH (outdated client or server)"
+                if "rate" in low and "limit" in low:
+                    return None, "RATE-LIMITED, slow down probes"
+
+                if sample_offline_hint is True:
+                    return True, f"CRACKED by players.sample UUID (disconnect: {reason})"
+                if sample_offline_hint is False and saw_encryption_request:
+                    return False, f"ONLINE-MODE (disconnect: {reason})"
+                return None, f"UNKNOWN MODE (disconnect: {reason})"
+
+            # Unknown login packets are ignored.
+
+    except socket.timeout:
+        if sample_offline_hint is True:
+            return True, "CRACKED by players.sample UUID, but login probe timed out"
+        return None, "Timed out waiting for login response"
+    except Exception as exc:
+        if sample_offline_hint is True:
+            return True, f"CRACKED by players.sample UUID, but login probe errored: {str(exc)[:60]}"
+        return None, f"Error: {str(exc)[:80]}"
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+def is_cracked_server(host, port=25565):
+    """
+    Returns (result, message) where result is True/False/None (cracked/online/unknown).
+    """
+    return login_probe(host, port)
+
+
 class UserLogManager:
     """
     Thread-safe store that tracks the last seen server for each player name.
@@ -547,7 +926,7 @@ def fetch_server_favicon_bytes(entry):  # returns raw PNG bytes or None
     return None
 
 # GUI-friendly scan with streaming callbacks
-def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None):
+def scan_servers_gui(servers, on_start=None, on_result=None, on_progress=None, login_probe=False):
     filtered = [s for s in servers if not is_ignored(s)]
     results, online_lines, updated_ips = [], [], {}
     total, done = len(filtered), 0
@@ -632,7 +1011,8 @@ def _ensure_monitor_server_entry(state, ip):
             "max_players": 0,
             "version": "N/A",
             "cracked": False,
-            "player_log": {}
+            "player_log": {},
+            "current_players": []
         }
     return entries[ip]
 
@@ -647,17 +1027,21 @@ def update_server_monitor_entry(state, ip, result, timestamp):
     entry["cracked"] = bool(result.get("cracked"))
     sample = result.get("players_sample") or []
     log = entry.setdefault("player_log", {})
+    current_ids = []
     for player_id, player_name in sample:
         uid = (player_id or "").strip()
         name = (player_name or "").strip()
         if not uid or not name:
             continue
         log[uid] = {"name": name, "last_seen": timestamp}
+        current_ids.append(uid)
+    entry["current_players"] = current_ids
 
 def mark_server_offline_in_state(state, ip, timestamp):
     entry = _ensure_monitor_server_entry(state, ip)
     entry["last_status"] = "offline"
     entry["last_ping"] = timestamp
+    entry["current_players"] = []
 
 def format_timestamp(ts):
     if not ts:
@@ -1283,6 +1667,8 @@ class ServersTab(ttk.Frame):  #
         self._in_ignore = False  # re-entrancy guard
         self._build_ui()
         self._current_scan_ip = None 
+        self._scan_row_map = {}
+        self._cracked_job_id = 0
 
     def add_ignore(self):  #
         sel = self._selected_ips_any()
@@ -1378,6 +1764,8 @@ class ServersTab(ttk.Frame):  #
         ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
         self.only_players_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
+        self.only_cracked_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="Only cracked servers", variable=self.only_cracked_var).pack(anchor="w")
 
         # --- Results area (MIDDLE) ---
         bottom = ttk.Frame(pane_mid)
@@ -1634,10 +2022,40 @@ class ServersTab(ttk.Frame):  #
         else:
             self.set_status(f"No matches for '{query_raw.strip()}'.")
 
+    def _reset_scan_row_map(self):
+        self._scan_row_map = {}
+
+    def _register_scan_row(self, ip, iid):
+        self._scan_row_map[ip] = iid
+
+    def _update_scan_row_cracked(self, ip, text):
+        iid = self._scan_row_map.get(ip)
+        if not iid:
+            return
+        vals = list(self.results_tree.item(iid, "values"))
+        if len(vals) >= 5:
+            vals[4] = text
+            self.results_tree.item(iid, values=vals)
+
+    def _remove_scan_row(self, ip):
+        iid = self._scan_row_map.pop(ip, None)
+        if iid:
+            self.results_tree.delete(iid)
+
     def _scan(self, items):
         for iid in self.results_tree.get_children():
             self.results_tree.delete(iid)
         self.set_status("Preparing scan...")
+        only_cracked = self.only_cracked_var.get()
+        if only_cracked:
+            self._reset_scan_row_map()
+            self._cracked_job_id += 1
+        else:
+            self._scan_row_map.clear()
+        current_job = self._cracked_job_id
+        pending_entries = []
+        pending_seen = set()
+        pending_lock = threading.Lock()
 
         def work():
             try:
@@ -1650,17 +2068,43 @@ class ServersTab(ttk.Frame):  #
                     if not r:
                         return
 
-                    if not self.only_players_var.get() or r.get('players', 0) > 0:
-                        active_players = format_player_list(r.get('players_sample'))
-                        vals = (
-                            r['ip'],
-                            r['motd'],
-                            f"{r['players']}/{r['max_players']}",
-                            r['version'],
-                            "Yes" if r.get('cracked') else "No",
-                            active_players
-                        )
-                        self.after(0, lambda v=vals: self.results_tree.insert("", "end", values=v))
+                    if self.only_players_var.get() and r.get('players', 0) <= 0:
+                        return
+
+                    if only_cracked and should_skip_cracked_probe(r):
+                        return
+
+                    cracked_text = "Yes" if r.get('cracked') else "No"
+                    queue_candidate = None
+                    if only_cracked:
+                        cached = get_cached_cracked_entry(r['ip'])
+                        if cached:
+                            cracked_text = "Yes (cached)"
+                        else:
+                            cracked_text = "Queued"
+                            queue_candidate = r
+
+                    active_players = format_player_list(r.get('players_sample'))
+                    vals = (
+                        r['ip'],
+                        r['motd'],
+                        f"{r['players']}/{r['max_players']}",
+                        r['version'],
+                        cracked_text,
+                        active_players
+                    )
+                    def add_row(ip=r['ip'], v=vals):
+                        iid = self.results_tree.insert("", "end", values=v)
+                        if only_cracked:
+                            self._register_scan_row(ip, iid)
+                    self.after(0, add_row)
+
+                    if only_cracked and queue_candidate:
+                        with pending_lock:
+                            ip = queue_candidate['ip']
+                            if ip not in pending_seen:
+                                pending_seen.add(ip)
+                                pending_entries.append(queue_candidate)
 
                 def on_progress(done, total):
                     ip = self._current_scan_ip or "…"
@@ -1668,9 +2112,39 @@ class ServersTab(ttk.Frame):  #
                                self.set_status(f"Currently scanning: {ip} [{d}/{t}]"))
 
                 results, online_lines = scan_servers_gui(
-                    items, on_start=on_start, on_result=on_result, on_progress=on_progress
+                    items,
+                    on_start=on_start,
+                    on_result=on_result,
+                    on_progress=on_progress
                 )
                 self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
+
+                if only_cracked:
+                    with pending_lock:
+                        verify_entries = list(pending_entries)
+                    def handle_update(entry, result, message, was_cached):
+                        if current_job != self._cracked_job_id:
+                            return
+                        ip = entry.get("ip")
+                        def ui():
+                            if was_cached or result is True:
+                                label = "Yes (cached)" if was_cached else "Yes"
+                                self._update_scan_row_cracked(ip, label)
+                            else:
+                                self._remove_scan_row(ip)
+                        self.after(0, ui)
+                    def handle_progress(done, total):
+                        if current_job != self._cracked_job_id:
+                            return
+                        if done < total:
+                            self.after(0, lambda d=done, t=total:
+                                       self.set_status(f"Verifying cracked servers: {d}/{t}"))
+                        else:
+                            def finish():
+                                remaining = len(self.results_tree.get_children())
+                                self.set_status(f"Cracked verification complete. Showing {remaining} server(s).")
+                            self.after(0, finish)
+                    run_cracked_verifier_async(verify_entries, handle_update, progress_cb=handle_progress)
             except Exception as e:
                 self.after(0, lambda: self.set_status(f"Scan failed: {e}"))
 
@@ -1811,6 +2285,7 @@ class ServerMonitorTab(ttk.Frame):
         player_scroll = ttk.Scrollbar(players_frame, orient="vertical", command=self.players_tree.yview)
         player_scroll.grid(row=1, column=1, sticky="ns")
         self.players_tree.configure(yscrollcommand=player_scroll.set)
+        self.players_tree.tag_configure("player_online", foreground="#0b8f0b")
         btn_frame = ttk.Frame(players_frame)
         btn_frame.grid(row=2, column=0, sticky="w", pady=(4,0))
         ttk.Button(btn_frame, text="Copy Username(s)", command=self.copy_selected_player_names).pack(side="left")
@@ -1968,6 +2443,9 @@ class ServerMonitorTab(ttk.Frame):
             ip = result.get("ip")
             if not ip:
                 continue
+            cached = get_cached_cracked_entry(ip)
+            if cached and not result.get("cracked"):
+                result["cracked"] = True
             update_server_monitor_entry(self.monitor_state, ip, result, cycle_ts)
             processed.add(ip)
         for ip in ips:
@@ -2052,12 +2530,14 @@ class ServerMonitorTab(ttk.Frame):
         entry = self.monitor_state.get("servers", {}).get(ip)
         if not entry:
             return
+        current_online = set(entry.get("current_players") or [])
         rows = []
         for uid, pdata in entry.get("player_log", {}).items():
             rows.append((uid, pdata.get("name", ""), pdata.get("last_seen", 0)))
         rows.sort(key=lambda item: item[2], reverse=True)
         for uid, name, last_seen in rows:
-            self.players_tree.insert("", "end", values=(uid, name, format_timestamp(last_seen)))
+            tags = ("player_online",) if uid in current_online else ()
+            self.players_tree.insert("", "end", values=(uid, name, format_timestamp(last_seen)), tags=tags)
 
     def _on_server_selected(self):
         selection = self.server_tree.selection()
@@ -2086,6 +2566,8 @@ class ShodanTab(ttk.Frame):
         self._in_ignore = False
         self._build_ui()
         self._current_scan_ip = None
+        self._scan_row_map = {}
+        self._cracked_job_id = 0
 
     def _build_ui(self):
         # Root grid: content (row 0) + footer (row 1) pinned
@@ -2150,6 +2632,8 @@ class ShodanTab(ttk.Frame):
         ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
         self.only_players_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
+        self.only_cracked_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="Only cracked servers", variable=self.only_cracked_var).pack(anchor="w")
 
         # BOTTOM: Scan output table
         out = ttk.Frame(pane_bottom)
@@ -2434,10 +2918,40 @@ class ShodanTab(ttk.Frame):
         else:
             self.set_status(f"No matches for '{query_raw.strip()}'.")
 
+    def _reset_scan_row_map(self):
+        self._scan_row_map = {}
+
+    def _register_scan_row(self, ip, iid):
+        self._scan_row_map[ip] = iid
+
+    def _update_scan_row_cracked(self, ip, text):
+        iid = self._scan_row_map.get(ip)
+        if not iid:
+            return
+        vals = list(self.scan_tree.item(iid, "values"))
+        if len(vals) >= 5:
+            vals[4] = text
+            self.scan_tree.item(iid, values=vals)
+
+    def _remove_scan_row(self, ip):
+        iid = self._scan_row_map.pop(ip, None)
+        if iid:
+            self.scan_tree.delete(iid)
+
     def _scan_and_show(self, items):
         for iid in self.scan_tree.get_children():
             self.scan_tree.delete(iid)
         self.set_status("Preparing scan...")
+        only_cracked = self.only_cracked_var.get()
+        if only_cracked:
+            self._reset_scan_row_map()
+            self._cracked_job_id += 1
+        else:
+            self._scan_row_map.clear()
+        current_job = self._cracked_job_id
+        pending_entries = []
+        pending_seen = set()
+        pending_lock = threading.Lock()
 
         def work():
             try:
@@ -2449,17 +2963,42 @@ class ShodanTab(ttk.Frame):
                     if not r:
                         return
 
-                    if not self.only_players_var.get() or r.get('players', 0) > 0:
-                        active_players = format_player_list(r.get('players_sample'))
-                        vals = (
-                            r['ip'],
-                            r['motd'],
-                            f"{r['players']}/{r['max_players']}",
-                            r['version'],
-                            "Yes" if r.get('cracked') else "No",
-                            active_players
-                        )
-                        self.after(0, lambda v=vals: self.scan_tree.insert("", "end", values=v))
+                    if self.only_players_var.get() and r.get('players', 0) <= 0:
+                        return
+                    if only_cracked and should_skip_cracked_probe(r):
+                        return
+
+                    cracked_text = "Yes" if r.get('cracked') else "No"
+                    queue_candidate = None
+                    if only_cracked:
+                        cached = get_cached_cracked_entry(r['ip'])
+                        if cached:
+                            cracked_text = "Yes (cached)"
+                        else:
+                            cracked_text = "Queued"
+                            queue_candidate = r
+
+                    active_players = format_player_list(r.get('players_sample'))
+                    vals = (
+                        r['ip'],
+                        r['motd'],
+                        f"{r['players']}/{r['max_players']}",
+                        r['version'],
+                        cracked_text,
+                        active_players
+                    )
+                    def add_row(ip=r['ip'], v=vals):
+                        iid = self.scan_tree.insert("", "end", values=v)
+                        if only_cracked:
+                            self._register_scan_row(ip, iid)
+                    self.after(0, add_row)
+
+                    if only_cracked and queue_candidate:
+                        with pending_lock:
+                            ip = queue_candidate['ip']
+                            if ip not in pending_seen:
+                                pending_seen.add(ip)
+                                pending_entries.append(queue_candidate)
 
                 def on_progress(done, total):
                     ip = self._current_scan_ip or "…"
@@ -2467,9 +3006,39 @@ class ShodanTab(ttk.Frame):
                                self.set_status(f"Currently scanning: {ip} [{d}/{t}]"))
 
                 results, online_lines = scan_servers_gui(
-                    items, on_start=on_start, on_result=on_result, on_progress=on_progress
+                    items,
+                    on_start=on_start,
+                    on_result=on_result,
+                    on_progress=on_progress
                 )
                 self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
+
+                if only_cracked:
+                    with pending_lock:
+                        verify_entries = list(pending_entries)
+                    def handle_update(entry, result, message, was_cached):
+                        if current_job != self._cracked_job_id:
+                            return
+                        ip = entry.get("ip")
+                        def ui():
+                            if was_cached or result is True:
+                                label = "Yes (cached)" if was_cached else "Yes"
+                                self._update_scan_row_cracked(ip, label)
+                            else:
+                                self._remove_scan_row(ip)
+                        self.after(0, ui)
+                    def handle_progress(done, total):
+                        if current_job != self._cracked_job_id:
+                            return
+                        if done < total:
+                            self.after(0, lambda d=done, t=total:
+                                       self.set_status(f"Verifying cracked servers: {d}/{t}"))
+                        else:
+                            def finish():
+                                remaining = len(self.scan_tree.get_children())
+                                self.set_status(f"Cracked verification complete. Showing {remaining} server(s).")
+                            self.after(0, finish)
+                    run_cracked_verifier_async(verify_entries, handle_update, progress_cb=handle_progress)
             except Exception as e:
                 self.after(0, lambda: self.set_status(f"Scan failed: {e}"))
 
@@ -2531,6 +3100,8 @@ class JSONTab(ttk.Frame):
         self._loaded_json_path = None
         self._build_ui()
         self._current_scan_ip = None
+        self._scan_row_map = {}
+        self._cracked_job_id = 0
         self.search_rows = []  # list[tuple(ip,motd,players,version)]
         default_path = self.file_var.get().strip()
         if default_path and os.path.exists(default_path):
@@ -2598,6 +3169,8 @@ class JSONTab(ttk.Frame):
         ttk.Button(right, text="Scan All", command=self.scan_all).pack(fill="x", pady=2)
         self.only_players_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="Only players > 0", variable=self.only_players_var).pack(anchor="w", pady=(8,0))
+        self.only_cracked_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="Only cracked servers", variable=self.only_cracked_var).pack(anchor="w")
 
         # Scan output -> Treeview (still inside content)
         out = ttk.Frame(pane)
@@ -2854,10 +3427,40 @@ class JSONTab(ttk.Frame):
         else:
             self.set_status(f"No matches for '{query_raw.strip()}'.")
 
+    def _reset_scan_row_map(self):
+        self._scan_row_map = {}
+
+    def _register_scan_row(self, ip, iid):
+        self._scan_row_map[ip] = iid
+
+    def _update_scan_row_cracked(self, ip, text):
+        iid = self._scan_row_map.get(ip)
+        if not iid:
+            return
+        vals = list(self.scan_tree.item(iid, "values"))
+        if len(vals) >= 5:
+            vals[4] = text
+            self.scan_tree.item(iid, values=vals)
+
+    def _remove_scan_row(self, ip):
+        iid = self._scan_row_map.pop(ip, None)
+        if iid:
+            self.scan_tree.delete(iid)
+
     def _scan_and_show(self, items):
         for iid in self.scan_tree.get_children():
             self.scan_tree.delete(iid)
         self.set_status("Preparing scan...")
+        only_cracked = self.only_cracked_var.get()
+        if only_cracked:
+            self._reset_scan_row_map()
+            self._cracked_job_id += 1
+        else:
+            self._scan_row_map.clear()
+        current_job = self._cracked_job_id
+        pending_entries = []
+        pending_seen = set()
+        pending_lock = threading.Lock()
 
         def work():
             try:
@@ -2870,17 +3473,42 @@ class JSONTab(ttk.Frame):
                     if not r:
                         return
 
-                    if not self.only_players_var.get() or r.get('players', 0) > 0:
-                        active_players = format_player_list(r.get('players_sample'))
-                        vals = (
-                            r['ip'],
-                            r['motd'],
-                            f"{r['players']}/{r['max_players']}",
-                            r['version'],
-                            "Yes" if r.get('cracked') else "No",
-                            active_players
-                        )
-                        self.after(0, lambda v=vals: self.scan_tree.insert("", "end", values=v))
+                    if self.only_players_var.get() and r.get('players', 0) <= 0:
+                        return
+                    if only_cracked and should_skip_cracked_probe(r):
+                        return
+
+                    cracked_text = "Yes" if r.get('cracked') else "No"
+                    queue_candidate = None
+                    if only_cracked:
+                        cached = get_cached_cracked_entry(r['ip'])
+                        if cached:
+                            cracked_text = "Yes (cached)"
+                        else:
+                            cracked_text = "Queued"
+                            queue_candidate = r
+
+                    active_players = format_player_list(r.get('players_sample'))
+                    vals = (
+                        r['ip'],
+                        r['motd'],
+                        f"{r['players']}/{r['max_players']}",
+                        r['version'],
+                        cracked_text,
+                        active_players
+                    )
+                    def add_row(ip=r['ip'], v=vals):
+                        iid = self.scan_tree.insert("", "end", values=v)
+                        if only_cracked:
+                            self._register_scan_row(ip, iid)
+                    self.after(0, add_row)
+
+                    if only_cracked and queue_candidate:
+                        with pending_lock:
+                            ip = queue_candidate['ip']
+                            if ip not in pending_seen:
+                                pending_seen.add(ip)
+                                pending_entries.append(queue_candidate)
 
                 def on_progress(done, total):
                     ip = self._current_scan_ip or "…"
@@ -2888,9 +3516,39 @@ class JSONTab(ttk.Frame):
                                self.set_status(f"Currently scanning: {ip} [{d}/{t}]"))
 
                 results, online_lines = scan_servers_gui(
-                    items, on_start=on_start, on_result=on_result, on_progress=on_progress
+                    items,
+                    on_start=on_start,
+                    on_result=on_result,
+                    on_progress=on_progress
                 )
                 self.after(0, lambda: self.set_status(f"Scan complete. Responded: {len(results)}; With 1+: {len(online_lines)}"))
+
+                if only_cracked:
+                    with pending_lock:
+                        verify_entries = list(pending_entries)
+                    def handle_update(entry, result, message, was_cached):
+                        if current_job != self._cracked_job_id:
+                            return
+                        ip = entry.get("ip")
+                        def ui():
+                            if was_cached or result is True:
+                                label = "Yes (cached)" if was_cached else "Yes"
+                                self._update_scan_row_cracked(ip, label)
+                            else:
+                                self._remove_scan_row(ip)
+                        self.after(0, ui)
+                    def handle_progress(done, total):
+                        if current_job != self._cracked_job_id:
+                            return
+                        if done < total:
+                            self.after(0, lambda d=done, t=total:
+                                       self.set_status(f"Verifying cracked servers: {d}/{t}"))
+                        else:
+                            def finish():
+                                remaining = len(self.scan_tree.get_children())
+                                self.set_status(f"Cracked verification complete. Showing {remaining} server(s).")
+                            self.after(0, finish)
+                    run_cracked_verifier_async(verify_entries, handle_update, progress_cb=handle_progress)
             except Exception as e:
                 self.after(0, lambda: self.set_status(f"Scan failed: {e}"))
 
