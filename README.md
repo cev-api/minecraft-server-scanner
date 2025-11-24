@@ -2,7 +2,8 @@
 
 A desktop GUI for discovering and testing Minecraft servers. It searches Shodan, imports/exports server lists, pings servers concurrently to fetch live status, and can export results directly into your Minecraft `servers.dat`.
 
-![UI](https://i.imgur.com/t1dlk7Y.png)
+![UI](https://i.imgur.com/ftBcq2W.png)
+![Monitor](https://i.imgur.com/NIkwWCl.png)
 
 ---
 
@@ -19,7 +20,7 @@ A desktop GUI for discovering and testing Minecraft servers. It searches Shodan,
 - **Player filter:** Only show severs that have currently active players.
 - **Shows Players:** You can see and search who's currently playing on the detected servers.
 - **Logs Players:** Keeps a list of all discovered players and the last server they were in.
-- **Cracked:** Shows which servers are cracked.
+- **Cracked:** Shows which servers are cracked (via UUID detection) when running normal scans. More robust faux login attempt scan (more accurate on servers with no players) available via toggle.
 - **Server Monitor**: Monitors selected servers every minute and logs all players.
 
 ---
@@ -31,16 +32,21 @@ A desktop GUI for discovering and testing Minecraft servers. It searches Shodan,
 - Scan **Selected** or **All**; live results appear below in another table.
 - Actions on either table: **Copy IP(s)**, **Add to Ignore**, **Add to Saved**, **Export Scan…**.
 - Optional filter: “Only players > 0” for scan output.
+- Optional filter: "Only cracked servers" - Will scan all servers normally then rescan respondant servers to check if theyre cracked via faux login method.
 
 ### Shodan
 - Type a query **without** the word `minecraft` (the app prepends it).
 - Results table is sortable with actions identical to the Servers tab.
 - Scan **Selected/All** from the results; export results or scan output.
+- Optional filter: “Only players > 0” for scan output.
+- Optional filter: "Only cracked servers" - Will scan all servers normally then rescan respondant servers to check if theyre cracked via faux login method.
 
 ### JSON Search
 - Point at a local `minecraft_servers.json`/`.jsonl` or any JSON Lines file with Shodan entries.
 - Enter a boolean query (see below) and browse sortable matches.
 - Scan **Selected/All**; export search results or scan output.
+- Optional filter: “Only players > 0” for scan output.
+- Optional filter: "Only cracked servers" - Will scan all servers normally then rescan respondant servers to check if theyre cracked via faux login method.
 
 ### Export to MC
 - Choose a `.txt` and export it directly into `%APPDATA%\.minecraft\servers.dat`.
